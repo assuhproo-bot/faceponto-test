@@ -6,6 +6,7 @@ import { api, ApiError, type BankEntry, type Employee, type EmployeeLocation, ty
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
 const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined;
 const supabase = supabaseUrl && publishableKey ? createClient(supabaseUrl, publishableKey) : null;
+const pendingCompanyKey = 'faceponto.pending-company';
 
 type DashboardData = {
   days: WorkDay[]; occurrences: Occurrence[]; bank: BankEntry[]; balance: number; punches: Punch[]; adjustments: PunchAdjustment[];
@@ -50,7 +51,11 @@ function Access() {
       } else {
         const { data, error } = await supabase!.auth.signUp({ email, password });
         if (error) throw error;
-        if (!data.session) { setMessage('Confira o e-mail para confirmar a conta antes de entrar.'); return; }
+        if (!data.session) {
+          localStorage.setItem(pendingCompanyKey, JSON.stringify({ name: company, display_name: displayName }));
+          setMessage('Confira o e-mail para confirmar a conta. A empresa será criada automaticamente no primeiro acesso.');
+          return;
+        }
         await api('/v1/companies', data.session.access_token, {
           method: 'POST', body: JSON.stringify({ name: company, display_name: displayName, timezone: 'America/Fortaleza' }),
         });
@@ -79,9 +84,29 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
   const [me, setMe] = useState<Me | null>(null); const [companyId, setCompanyId] = useState('');
   const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState(''); const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0);
+  const [accountRefresh, setAccountRefresh] = useState(0); const [bootstrapAttempted, setBootstrapAttempted] = useState(false);
   useEffect(() => { void api<Me>('/v1/me', session.access_token).then((value) => {
     setMe(value); setCompanyId((previous) => previous || value.memberships[0]?.company_id || '');
-  }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Não foi possível carregar a conta.')); }, [session.access_token]);
+  }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Não foi possível carregar a conta.')); }, [session.access_token, accountRefresh]);
+  useEffect(() => {
+    if (!me || me.memberships.length || bootstrapAttempted) return;
+    setBootstrapAttempted(true);
+    const raw = localStorage.getItem(pendingCompanyKey);
+    if (!raw) return;
+    try {
+      const pending = JSON.parse(raw) as { name?: string; display_name?: string };
+      if (!pending.name || !pending.display_name) throw new Error('Dados de empresa incompletos.');
+      void api('/v1/companies', session.access_token, {
+        method: 'POST', body: JSON.stringify({ ...pending, timezone: 'America/Fortaleza' }),
+      }).then(() => {
+        localStorage.removeItem(pendingCompanyKey);
+        setAccountRefresh((value) => value + 1);
+      }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Não foi possível criar a empresa.'));
+    } catch (cause) {
+      localStorage.removeItem(pendingCompanyKey);
+      setError(cause instanceof Error ? cause.message : 'Não foi possível recuperar os dados da empresa.');
+    }
+  }, [bootstrapAttempted, me, session.access_token]);
   useEffect(() => {
     if (!companyId) { setLoading(false); return; }
     let active = true; setLoading(true); setError('');
