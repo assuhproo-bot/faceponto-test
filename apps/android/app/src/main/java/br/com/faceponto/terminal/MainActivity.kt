@@ -135,8 +135,14 @@ class MainActivity : ComponentActivity() {
                     requireFaceExit = false
                     movementChallenge = MovementChallengeState.create()
                     padFrames = emptyList()
-                    captureMessage = null
+                    captureMessage = "Ponto registrado. Pronto para a próxima marcação."
                 }
+                return@let
+            }
+            if (it.count == 0 && movementChallenge.step != MovementStep.CENTER) {
+                movementChallenge = MovementChallengeState.create()
+                padFrames = emptyList()
+                captureMessage = "Desafio interrompido. Mantenha o rosto na câmera durante todas as etapas."
                 return@let
             }
             val now = android.os.SystemClock.elapsedRealtime()
