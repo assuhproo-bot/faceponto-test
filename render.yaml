@@ -1,0 +1,38 @@
+services:
+  - type: web
+    runtime: node
+    name: faceponto-hdignlvf-api
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm run api:start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 24.15.0
+      - key: HOST
+        value: 0.0.0.0
+      - key: ENABLE_ATTENDANCE_WORKER
+        value: "true"
+      - key: ADMIN_ORIGIN
+        value: https://faceponto-hdignlvf-admin.onrender.com
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+
+  - type: web
+    runtime: static
+    name: faceponto-hdignlvf-admin
+    buildCommand: npm ci && npm run admin:build
+    staticPublishPath: apps/admin/dist
+    envVars:
+      - key: NODE_VERSION
+        value: 24.15.0
+      - key: VITE_API_URL
+        sync: false
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_PUBLISHABLE_KEY
+        sync: false

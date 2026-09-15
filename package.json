@@ -1,0 +1,57 @@
+{
+  "name": "faceponto",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "FacePonto — contratos e arquitetura do sistema de ponto facial",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:attendance": "node --test tests/attendance.test.mjs",
+    "check": "node scripts/check.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "supabase": "node scripts/supabase.mjs",
+    "db:start": "node scripts/supabase.mjs start",
+    "db:stop": "node scripts/supabase.mjs stop",
+    "db:status": "node scripts/supabase.mjs status",
+    "db:test": "node scripts/supabase.mjs test db",
+    "typecheck": "tsc --noEmit",
+    "api:dev": "tsx watch apps/api/src/server.ts",
+    "api:start": "tsx apps/api/src/server.ts",
+    "api:local": "node scripts/api-local.mjs",
+    "api:local:faults": "node scripts/api-local.mjs --enable-test-faults",
+    "api:test": "node scripts/api-integration.mjs",
+    "admin:dev": "vite --config apps/admin/vite.config.ts",
+    "admin:build": "vite build --config apps/admin/vite.config.ts",
+    "admin:local": "node scripts/admin-local.mjs",
+    "android:models": "node scripts/download-face-models.mjs",
+    "offline:provision": "node scripts/provision-offline-probe.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "26.5.1",
+    "@types/pdfkit": "^0.17.1",
+    "@types/pg": "8.15.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "pg": "8.16.3",
+    "supabase": "2.117.0",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2",
+    "vite": "^8.3.0"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@supabase/supabase-js": "2.116.0",
+    "fastify": "5.12.4",
+    "fflate": "^0.8.2",
+    "pdfkit": "^0.17.2",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "4.6.4"
+  }
+}

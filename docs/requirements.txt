@@ -1,0 +1,999 @@
+PROMPT MESTRE — SISTEMA DE PONTO FACIAL
+
+Nome provisório: FacePonto
+Plataforma: Android Tablet + Painel Administrativo Web
+Backend: API própria + Supabase
+Reconhecimento facial: Open Source, sem API facial paga
+Objetivo: registrar, calcular e administrar jornadas de funcionários por reconhecimento facial.
+
+1. OBJETIVO DO SISTEMA
+
+Desenvolver um sistema de controle de ponto para empresas.
+
+O funcionário não deve precisar digitar matrícula, CPF, senha ou tocar em opções complexas.
+
+O funcionário simplesmente:
+
+Chega ao tablet.
+Olha para a câmera.
+O sistema identifica seu rosto.
+Identifica o funcionário.
+Determina automaticamente o tipo da marcação.
+Registra data, horário e local.
+Mostra uma confirmação na tela.
+Volta automaticamente para a tela de espera.
+
+O sistema deve funcionar em dois ou mais locais físicos simultaneamente, utilizando uma única base central.
+
+Exemplo:
+
+Terminal 01 — Ponto de Açúcar
+Terminal 02 — Santa Cruz do Capibaribe
+
+Uma marcação feita em Ponto de Açúcar deve aparecer no painel administrativo junto com outra marcação feita em Santa Cruz.
+
+Não criar bancos separados por local.
+
+2. ARQUITETURA
+
+Criar três componentes principais:
+
+A. Aplicativo Android
+
+Instalado no tablet localizado na empresa.
+
+Responsável por:
+
+câmera;
+reconhecimento facial;
+identificação do funcionário;
+registro do ponto;
+funcionamento offline;
+armazenamento temporário;
+sincronização automática;
+identificação do terminal/local;
+comunicação com a API.
+B. Backend/API
+
+Responsável por:
+
+autenticação;
+funcionários;
+empresas;
+locais;
+terminais;
+jornadas;
+escalas;
+marcações;
+cálculos;
+sincronização;
+regras;
+relatórios;
+auditoria.
+C. Painel Administrativo Web
+
+Responsável por:
+
+funcionários;
+escalas;
+jornadas;
+locais;
+terminais;
+acompanhamento dos pontos;
+banco de horas;
+atrasos;
+horas extras;
+faltas;
+esquecimentos;
+relatórios;
+exportação.
+3. BANCO DE DADOS
+
+Utilizar Supabase inicialmente.
+
+Estruturar o banco de maneira que possa crescer posteriormente sem necessidade de reescrever o sistema.
+
+Criar tabelas bem normalizadas.
+
+Sugestão inicial:
+
+companies
+users
+employees
+locations
+terminals
+work_schedules
+schedule_assignments
+facial_profiles
+time_punches
+work_days
+attendance_occurrences
+bank_hours
+audit_logs
+sync_queue
+system_settings
+
+Todas as marcações devem possuir, no mínimo:
+
+id
+employee_id
+company_id
+location_id
+terminal_id
+timestamp
+punch_type
+source
+sync_status
+created_at
+
+Criar IDs únicos para impedir duplicação durante sincronização.
+
+4. APLICATIVO ANDROID
+
+O aplicativo deve ser desenvolvido especificamente para tablet Android.
+
+Não criar como website.
+
+Não transformar o terminal em um simples navegador.
+
+O aplicativo deve possuir modo de terminal/kiosk.
+
+Tela principal
+
+Mostrar algo extremamente simples:
+
+BEM-VINDO
+
+Olhe para a câmera
+
+[ CÂMERA ]
+
+Aguardando identificação...
+
+O funcionário não deve precisar tocar em botões para bater o ponto.
+
+5. RECONHECIMENTO FACIAL
+
+Utilizar uma solução open source que possa ser utilizada comercialmente sem cobrança por reconhecimento.
+
+Não utilizar:
+
+AWS Rekognition;
+Google Cloud Vision;
+Azure Face;
+APIs pagas por chamada;
+qualquer serviço que cobre por reconhecimento.
+
+O reconhecimento deve funcionar localmente no tablet sempre que tecnicamente possível.
+
+Criar uma camada de abstração:
+
+FaceRecognitionService
+
+Assim o restante do aplicativo não fica dependente diretamente de uma única biblioteca.
+
+Estrutura:
+
+Camera
+   ↓
+Face Detection
+   ↓
+Liveness
+   ↓
+Face Recognition
+   ↓
+Employee ID
+   ↓
+Time Punch
+6. ANTI-FRAUDE
+
+O sistema deve tentar impedir que uma pessoa bata ponto utilizando:
+
+fotografia;
+vídeo;
+tela de celular;
+imagem impressa.
+
+Implementar liveness detection.
+
+O sistema deve analisar se existe uma pessoa real diante da câmera.
+
+Não aceitar simplesmente uma fotografia do funcionário.
+
+Registrar ocorrências suspeitas.
+
+Exemplo:
+
+Tentativa de identificação suspeita
+Funcionário: João
+Terminal: Santa Cruz
+Horário: 07:58
+Motivo: falha no liveness
+7. CADASTRO FACIAL
+
+O gestor cria o funcionário no painel.
+
+Informações:
+
+Nome
+Matrícula
+CPF (se necessário)
+Cargo
+Departamento
+Local
+Escala
+Status
+
+Depois:
+
+Cadastrar rosto
+
+O sistema direciona o cadastro para um terminal autorizado.
+
+O funcionário olha para a câmera.
+
+Capturar múltiplas amostras em condições diferentes.
+
+Validar qualidade da imagem.
+
+Criar o perfil facial.
+
+Realizar teste imediatamente.
+
+Se o teste falhar:
+
+Não foi possível cadastrar o rosto.
+Tente novamente.
+
+Se funcionar:
+
+Cadastro facial concluído.
+8. MARCAÇÃO AUTOMÁTICA
+
+Não assumir que todos os funcionários possuem quatro marcações.
+
+O sistema deve trabalhar baseado na escala atribuída ao funcionário.
+
+Exemplo 1
+
+Funcionário:
+
+08:00 → entrada
+12:00 → saída intervalo
+13:30 → retorno
+18:00 → saída
+
+Quatro marcações.
+
+Exemplo 2
+
+Funcionário:
+
+14:00 → entrada
+22:00 → saída
+
+Duas marcações.
+
+Exemplo 3 — turno noturno
+22:00 → entrada
+06:00 → saída
+
+A saída ocorre no dia seguinte.
+
+O sistema precisa entender que isso pertence à mesma jornada.
+
+9. MOTOR DE JORNADA
+
+Criar um motor de cálculo de jornada independente da interface.
+
+Ele deve receber:
+
+Funcionário
+Escala
+Data
+Marcações
+Regras
+
+E produzir:
+
+Horas previstas
+Horas trabalhadas
+Atrasos
+Saídas antecipadas
+Intervalos
+Horas extras
+Banco de horas
+Faltas
+Marcações incompletas
+Ocorrências
+
+Não colocar essas regras diretamente nas telas.
+
+10. ATRASOS
+
+Exemplo:
+
+Jornada:
+
+08:00
+
+Funcionário:
+
+08:05
+
+Resultado:
+
+Atraso: 5 minutos
+
+O sistema deve acumular:
+
+Atrasos no dia
+Atrasos na semana
+Atrasos no mês
+Quantidade de dias atrasados
+11. HORAS EXTRAS
+
+O sistema deve comparar automaticamente:
+
+Jornada prevista
+X
+Jornada efetivamente trabalhada
+
+Exemplo:
+
+Entrada prevista: 08:00
+Entrada real: 08:05
+
+Saída prevista: 18:00
+Saída real: 18:40
+
+Não simplesmente considerar os 40 minutos como hora extra.
+
+Primeiro calcular as diferenças.
+
+Resultado conceitual:
+
+Atraso: 5 minutos
+Hora extra: 40 minutos
+Saldo líquido: +35 minutos
+
+Porém, deixar tolerâncias e regras configuráveis no painel.
+
+Não fixar regras trabalhistas no código.
+
+12. ESQUECIMENTO DE PONTO
+
+Criar um sistema de alertas.
+
+Exemplo:
+
+Funcionário possui:
+
+08:00 entrada
+12:00 saída
+13:00 retorno
+
+Mas não existe marcação final.
+
+Gerar:
+
+⚠️ Possível esquecimento de ponto
+Funcionário: João
+Data: 13/09/2026
+Marcação incompleta
+
+Também calcular frequência:
+
+Esquecimentos no mês: 4
+
+O gestor pode visualizar funcionários com maior quantidade de ocorrências.
+
+13. ALERTAS ADMINISTRATIVOS
+
+Criar categorias:
+
+🔴 Crítico
+marcação impossível;
+tentativa suspeita;
+duplicidade;
+inconsistência grave.
+🟡 Atenção
+esquecimento;
+atraso;
+saída antecipada;
+jornada incompleta.
+🔵 Informativo
+hora extra;
+banco de horas positivo;
+funcionário registrado em outro local.
+14. DOIS LOCAIS
+
+O funcionário pode registrar ponto em qualquer terminal autorizado.
+
+Exemplo:
+
+07:55
+Ponto de Açúcar
+Entrada
+
+Depois:
+
+18:10
+Santa Cruz
+Saída
+
+O sistema deve interpretar ambas como pertencentes à mesma jornada quando as regras permitirem.
+
+No painel:
+
+Horário	Funcionário	Local	Tipo
+07:55	João	Ponto de Açúcar	Entrada
+12:00	João	Ponto de Açúcar	Saída
+13:00	João	Santa Cruz	Retorno
+18:10	João	Santa Cruz	Saída
+15. FUNCIONAMENTO OFFLINE
+
+Este é um requisito obrigatório.
+
+Se a internet cair:
+
+o funcionário continua conseguindo bater ponto.
+
+O tablet precisa manter localmente:
+
+ID da marcação
+Funcionário
+Data
+Hora
+Terminal
+Local
+Tipo
+Status
+
+Criar uma fila:
+
+SYNC_QUEUE
+
+Quando a internet retornar:
+
+Tablet
+ ↓
+Detecta conexão
+ ↓
+Envia marcações pendentes
+ ↓
+API valida
+ ↓
+Supabase recebe
+ ↓
+Servidor confirma
+ ↓
+Tablet marca como sincronizado
+
+Nunca enviar uma marcação duas vezes.
+
+Utilizar IDs únicos e mecanismo de idempotência.
+
+16. HORÁRIO OFFLINE
+
+O aplicativo não deve depender exclusivamente do relógio fornecido pelo servidor.
+
+Precisa existir uma estratégia para manter o horário confiável durante períodos offline.
+
+Registrar:
+
+device_timestamp
+server_timestamp
+
+Quando sincronizar, o servidor deve analisar inconsistências.
+
+Se houver alteração suspeita do relógio do dispositivo:
+
+⚠️ Inconsistência de horário detectada
+
+Registrar no log.
+
+17. PAINEL ADMINISTRATIVO
+
+Criar painel web responsivo.
+
+Dashboard inicial:
+
+Funcionários ativos
+Presentes hoje
+Ausentes
+Atrasados
+Horas extras
+Ocorrências
+Marcações incompletas
+18. FUNCIONÁRIOS
+
+Tela:
+
+Funcionários
+
+Permitir:
+
+cadastrar;
+editar;
+ativar;
+desativar;
+definir escala;
+definir local;
+cadastrar rosto;
+consultar histórico;
+consultar banco de horas.
+19. ESCALAS
+
+Criar cadastro de escalas.
+
+Exemplo:
+
+Escala A
+08:00 → 12:00
+13:30 → 18:00
+Escala B
+14:00 → 22:00
+Escala C
+22:00 → 06:00
+
+Permitir configurar:
+
+horários;
+intervalo;
+tolerância;
+dias da semana;
+jornada noturna;
+regras de hora extra.
+20. ESPELHO DE PONTO
+
+Criar tela semelhante a um espelho de ponto.
+
+Exemplo:
+
+Data	Entrada	Saída	Retorno	Saída	Trabalhado	Extra	Atraso
+01/09	08:02	12:00	13:30	18:30	8h58	30m	2m
+02/09	08:00	12:00	13:30	18:00	8h30	0	0
+03/09	08:10	12:00	—	—	—	—	ocorrência
+21. FILTROS
+
+Permitir filtrar:
+
+Funcionário
+Departamento
+Local
+Período
+Escala
+Tipo de ocorrência
+
+Períodos:
+
+Hoje
+Semana
+Mês
+Período personalizado
+22. RELATÓRIOS
+
+Criar relatórios:
+
+Relatório individual
+
+Mostrar:
+
+horas trabalhadas;
+atrasos;
+horas extras;
+faltas;
+banco de horas;
+esquecimentos;
+ocorrências.
+Relatório da empresa
+
+Mostrar os mesmos indicadores agrupados por funcionário.
+
+Relatório por local
+
+Comparar:
+
+Santa Cruz
+Ponto de Açúcar
+23. EXPORTAÇÃO
+
+Permitir:
+
+Excel
+
+Exportar dados estruturados.
+
+PDF
+
+Gerar relatório visual pronto para impressão/arquivo.
+
+Filtros aplicados devem ser respeitados.
+
+Exemplo:
+
+Funcionário: João
+Período: 01/09/2026 – 30/09/2026
+Local: Todos
+
+O PDF deve apresentar o resultado exatamente daquele filtro.
+
+24. BANCO DE HORAS
+
+Criar cálculo automático:
+
+Horas previstas
+-
+Horas efetivamente trabalhadas
+=
+Saldo
+
+Exemplo:
+
++00:35
+
+Outro dia:
+
+-00:20
+
+Saldo:
+
++00:15
+
+Mostrar:
+
+Saldo diário
+Saldo semanal
+Saldo mensal
+Saldo acumulado
+25. HISTÓRICO E AUDITORIA
+
+Toda alteração administrativa importante deve gerar log.
+
+Exemplo:
+
+Usuário: Administrador
+Ação: Alteração de jornada
+Funcionário: João
+Antes: 08:00–18:00
+Depois: 08:00–17:00
+Data/hora: ...
+
+Não permitir apagar silenciosamente registros importantes.
+
+Quando uma marcação for corrigida manualmente:
+
+Valor original
+Novo valor
+Motivo
+Usuário responsável
+Data
+Hora
+26. SEGURANÇA
+
+Implementar:
+
+autenticação;
+autorização por função;
+isolamento entre empresas;
+Row Level Security no Supabase;
+criptografia em trânsito;
+proteção das credenciais;
+logs;
+tokens seguros;
+sincronização autenticada.
+
+Criar perfis:
+
+Administrador
+Gestor
+RH
+Operador
+Terminal
+27. TERMINAIS
+
+Cada tablet deve possuir identificação própria.
+
+Exemplo:
+
+Terminal: T001
+Local: Santa Cruz
+
+Outro:
+
+Terminal: T002
+Local: Ponto de Açúcar
+
+O administrador deve conseguir:
+
+cadastrar terminal;
+ativar;
+desativar;
+associar local;
+visualizar última sincronização;
+visualizar status online/offline.
+28. MONITORAMENTO
+
+No painel:
+
+T001 — ONLINE
+Última sincronização: agora
+
+T002 — OFFLINE
+Última sincronização: 8 minutos atrás
+
+Isso é importante porque o gestor precisa saber se um terminal está sem comunicação.
+
+29. EXPERIÊNCIA DO FUNCIONÁRIO
+
+A experiência deve ser extremamente simples.
+
+Fluxo:
+
+┌─────────────────────┐
+│                     │
+│      BEM-VINDO      │
+│                     │
+│    👤 CÂMERA        │
+│                     │
+│ Olhe para a câmera  │
+│                     │
+└─────────────────────┘
+
+Reconheceu:
+
+Olá, João!
+
+Entrada registrada
+08:02
+
+Bom trabalho!
+
+Depois de alguns segundos:
+
+Aguardando próximo funcionário...
+30. ERROS
+
+Não mostrar mensagens técnicas ao funcionário.
+
+Em vez de:
+
+FaceEmbeddingException
+
+mostrar:
+
+Não conseguimos identificar você.
+
+Posicione seu rosto diante da câmera
+e tente novamente.
+31. PRINCÍPIO FUNDAMENTAL DO PROJETO
+
+Não criar funcionalidades desnecessárias no MVP.
+
+O primeiro objetivo é fazer este ciclo funcionar:
+
+CADASTRO
+   ↓
+ROSTO
+   ↓
+TABLET
+   ↓
+RECONHECIMENTO
+   ↓
+MARCAÇÃO
+   ↓
+OFFLINE
+   ↓
+SINCRONIZAÇÃO
+   ↓
+SUPABASE
+   ↓
+PAINEL
+   ↓
+CÁLCULO
+   ↓
+RELATÓRIO
+
+Se esse ciclo funcionar corretamente, temos o produto-base.
+
+32. ORDEM OBRIGATÓRIA DE DESENVOLVIMENTO
+
+Não desenvolver tudo simultaneamente.
+
+FASE 01 — Arquitetura
+
+Definir:
+
+stack;
+estrutura do projeto;
+banco;
+API;
+autenticação;
+modelo de dados.
+FASE 02 — Supabase
+
+Criar:
+
+tabelas;
+relacionamentos;
+RLS;
+usuários;
+empresas;
+funcionários;
+locais;
+terminais.
+FASE 03 — API
+
+Criar:
+
+autenticação;
+funcionários;
+marcações;
+terminais;
+sincronização;
+jornadas.
+FASE 04 — Aplicativo Android
+
+Criar:
+
+câmera;
+tela de espera;
+reconhecimento;
+registro;
+confirmação.
+FASE 05 — Offline
+
+Implementar:
+
+banco local;
+fila;
+sincronização;
+prevenção de duplicidade.
+FASE 06 — Reconhecimento facial
+
+Implementar:
+
+cadastro;
+reconhecimento;
+liveness;
+testes;
+tratamento de falhas.
+FASE 07 — Motor de jornada
+
+Implementar:
+
+escalas;
+entradas;
+saídas;
+intervalos;
+atrasos;
+extras;
+banco de horas;
+ocorrências.
+FASE 08 — Painel
+
+Implementar:
+
+dashboard;
+funcionários;
+escalas;
+marcações;
+ocorrências;
+banco de horas.
+FASE 09 — Relatórios
+
+Implementar:
+
+PDF;
+Excel;
+filtros;
+relatórios individuais;
+relatórios gerais.
+FASE 10 — Testes
+
+Testar obrigatoriamente:
+
+internet funcionando;
+internet desligada;
+internet retornando;
+dois tablets simultâneos;
+funcionário em dois locais;
+reconhecimento facial;
+tentativa com foto;
+marcação duplicada;
+turno noturno;
+jornada de duas batidas;
+jornada de quatro batidas;
+atraso;
+hora extra;
+esquecimento;
+banco de horas;
+exportação.
+33. REGRA PARA A IA DESENVOLVEDORA
+
+Não tente gerar todo o sistema em uma única etapa.
+
+Antes de implementar cada fase:
+
+Analise a arquitetura.
+Identifique dependências.
+Crie o código.
+Execute testes.
+Corrija erros.
+Verifique se a fase funciona.
+Somente depois avance.
+
+Não criar código fictício.
+
+Não criar APIs inexistentes.
+
+Não substituir requisitos por soluções mais simples sem autorização.
+
+Quando houver uma decisão técnica importante, explicar:
+
+Problema
+→ Opções
+→ Escolha recomendada
+→ Motivo
+
+Priorizar:
+
+simplicidade + estabilidade + custo recorrente mínimo + funcionamento offline + possibilidade de crescimento.
+
+34. RESTRIÇÃO DE CUSTOS
+
+O sistema deve ser projetado para que os únicos custos recorrentes necessários sejam:
+
+infraestrutura/banco de dados, conforme o crescimento do projeto.
+
+Não utilizar serviços que cobrem por:
+
+reconhecimento facial;
+quantidade de funcionários reconhecidos;
+quantidade de chamadas de IA;
+quantidade de marcações;
+quantidade de requisições faciais.
+
+Sempre priorizar soluções open source e auto-hospedáveis.
+
+35. RESULTADO FINAL ESPERADO
+
+Ao finalizar o MVP, deverá ser possível:
+
+1. Criar uma empresa.
+2. Criar funcionários.
+3. Criar escalas.
+4. Cadastrar rostos.
+5. Configurar dois terminais.
+6. Instalar o APK nos tablets.
+7. Funcionário olhar para a câmera.
+8. Sistema identificar o funcionário.
+9. Registrar automaticamente o ponto.
+10. Continuar funcionando sem internet.
+11. Sincronizar quando a internet retornar.
+12. Centralizar os dois locais no mesmo banco.
+13. Calcular jornada automaticamente.
+14. Detectar atrasos.
+15. Detectar horas extras.
+16. Detectar esquecimentos.
+17. Calcular banco de horas.
+18. Gestor consultar o período.
+19. Gestor visualizar o espelho de ponto.
+20. Gestor exportar PDF e Excel.
+
+Não considerar o projeto concluído enquanto esse fluxo completo não estiver funcionando de ponta a ponta.
+
+Uma decisão que eu manteria desde já
+
+Eu não colocaria a lógica de “1ª batida = entrada, 2ª = saída...” diretamente no aplicativo.
+
+O tablet apenas registra:
+
+“João marcou às 14:02 no terminal T002.”
+
+Quem decide se aquilo é entrada, saída, intervalo, retorno ou hora extra é o motor de jornada no backend, usando a escala do funcionário.
+
+Isso é importante porque amanhã você pode mudar uma escala de 14h–22h para 14h–18h / 19h–23h sem precisar atualizar todos os tablets.
+
+Esse desenho deixa o aplicativo simples e o sistema inteligente.

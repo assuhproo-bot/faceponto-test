@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:faceponto:sync-request:v1",
+  "title": "Lote de eventos capturados por um terminal autenticado",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "events"],
+  "properties": {
+    "protocol_version": { "const": 1 },
+    "events": {
+      "type": "array", "minItems": 1, "maxItems": 100,
+      "items": { "$ref": "#/$defs/event" }
+    }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f-]{36}$" },
+    "timestamp": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "employee_id", "terminal_assignment_id", "device_timestamp", "device_elapsed_ms", "boot_id", "clock_anchor_id", "source", "recognition"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "employee_id": { "$ref": "#/$defs/uuid" },
+        "terminal_assignment_id": { "$ref": "#/$defs/uuid" },
+        "device_timestamp": { "$ref": "#/$defs/timestamp" },
+        "device_elapsed_ms": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "boot_id": { "$ref": "#/$defs/uuid" },
+        "clock_anchor_id": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+        "source": { "const": "face" },
+        "recognition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["profile_id", "profile_version", "recognition_model_sha256", "liveness_model_sha256", "policy_version", "liveness_session_id", "liveness_result"],
+          "properties": {
+            "profile_id": { "$ref": "#/$defs/uuid" },
+            "profile_version": { "type": "integer", "minimum": 1 },
+            "recognition_model_sha256": { "$ref": "#/$defs/hash" },
+            "liveness_model_sha256": { "$ref": "#/$defs/hash" },
+            "policy_version": { "type": "integer", "minimum": 1 },
+            "liveness_session_id": { "$ref": "#/$defs/uuid" },
+            "liveness_result": { "const": "passed" }
+          }
+        }
+      }
+    }
+  }
+}

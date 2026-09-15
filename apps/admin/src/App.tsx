@@ -1,0 +1,365 @@
+import { useEffect, useMemo, useState } from 'react';
+import type { FormEvent } from 'react';
+import { createClient, type Session } from '@supabase/supabase-js';
+import { api, ApiError, type BankEntry, type Employee, type EmployeeLocation, type EmployeeSchedulePlan, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined;
+const supabase = supabaseUrl && publishableKey ? createClient(supabaseUrl, publishableKey) : null;
+
+type DashboardData = {
+  days: WorkDay[]; occurrences: Occurrence[]; bank: BankEntry[]; balance: number; punches: Punch[]; adjustments: PunchAdjustment[];
+  employees: Employee[]; locations: Location[]; employeeLocations: EmployeeLocation[];
+  schedules: Schedule[]; scheduleAssignments: ScheduleAssignmentRecord[]; dailyPlans: EmployeeSchedulePlan[]; terminals: Terminal[];
+};
+
+function minutes(value: number | null | undefined) {
+  if (value == null) return '—';
+  const sign = value < 0 ? '−' : value > 0 ? '+' : '';
+  const absolute = Math.abs(value);
+  return `${sign}${Math.floor(absolute / 60)}h${String(absolute % 60).padStart(2, '0')}`;
+}
+function dateTime(value: string) { return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)); }
+function currentCalculation(day: WorkDay) { return day.attendance_calculations.find((item) => item.state !== 'superseded') ?? day.attendance_calculations[0]; }
+
+export function App() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    if (!supabase) { setReady(true); return; }
+    void supabase.auth.getSession().then(({ data }) => { setSession(data.session); setReady(true); });
+    const { data } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
+    return () => data.subscription.unsubscribe();
+  }, []);
+  if (!ready) return <main className="centered">Carregando sessão…</main>;
+  if (!supabase) return <main className="centered error">Configure as variáveis públicas do Supabase para iniciar o painel.</main>;
+  return session ? <Dashboard session={session} onLogout={() => void supabase.auth.signOut()} /> : <Access />;
+}
+
+function Access() {
+  const [mode, setMode] = useState<'login' | 'signup'>('login');
+  const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
+  const [company, setCompany] = useState(''); const [displayName, setDisplayName] = useState('');
+  const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setMessage(''); setPending(true);
+    try {
+      if (mode === 'login') {
+        const { error } = await supabase!.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      } else {
+        const { data, error } = await supabase!.auth.signUp({ email, password });
+        if (error) throw error;
+        if (!data.session) { setMessage('Confira o e-mail para confirmar a conta antes de entrar.'); return; }
+        await api('/v1/companies', data.session.access_token, {
+          method: 'POST', body: JSON.stringify({ name: company, display_name: displayName, timezone: 'America/Fortaleza' }),
+        });
+      }
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Não foi possível entrar.'); }
+    finally { setPending(false); }
+  }
+  return <main className="access"><section className="access-card">
+    <p className="eyebrow">FACEPONTO</p><h1>Painel administrativo</h1>
+    <p>Consulte jornadas, ocorrências e banco de horas. Correções preservam a marcação original.</p>
+    <form onSubmit={submit}>
+      <label>E-mail<input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+      <label>Senha<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={8} required value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+      {mode === 'signup' && <><label>Empresa<input required value={company} onChange={(event) => setCompany(event.target.value)} /></label>
+        <label>Seu nome<input required value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label></>}
+      {message && <p className="form-message">{message}</p>}
+      <button disabled={pending}>{pending ? 'Aguarde…' : mode === 'login' ? 'Entrar' : 'Criar conta e empresa'}</button>
+    </form>
+    <button className="link-button" onClick={() => { setMode(mode === 'login' ? 'signup' : 'login'); setMessage(''); }}>
+      {mode === 'login' ? 'Criar a primeira conta' : 'Já tenho uma conta'}
+    </button>
+  </section></main>;
+}
+
+function Dashboard({ session, onLogout }: { session: Session; onLogout: () => void }) {
+  const [me, setMe] = useState<Me | null>(null); const [companyId, setCompanyId] = useState('');
+  const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [data, setData] = useState<DashboardData | null>(null);
+  const [error, setError] = useState(''); const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0);
+  useEffect(() => { void api<Me>('/v1/me', session.access_token).then((value) => {
+    setMe(value); setCompanyId((previous) => previous || value.memberships[0]?.company_id || '');
+  }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Não foi possível carregar a conta.')); }, [session.access_token]);
+  useEffect(() => {
+    if (!companyId) { setLoading(false); return; }
+    let active = true; setLoading(true); setError('');
+    const query = { company_id: companyId, date_from: from || undefined, date_to: to || undefined };
+    void Promise.all([
+      api<{ data: WorkDay[] }>(withQuery('/v1/attendance', query), session.access_token),
+      api<{ data: Occurrence[] }>(withQuery('/v1/occurrences', { company_id: companyId }), session.access_token),
+      api<{ data: BankEntry[]; balance_minutes: number }>(withQuery('/v1/bank-hours', query), session.access_token),
+      api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId }), session.access_token),
+      api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId }), session.access_token),
+      api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId, active: 'true' }), session.access_token),
+      api<{ data: EmployeeLocation[] }>(withQuery('/v1/employee-locations', { company_id: companyId }), session.access_token),
+      api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
+      api<{ data: Schedule[] }>(withQuery('/v1/schedules', { company_id: companyId }), session.access_token),
+      api<{ data: ScheduleAssignmentRecord[] }>(withQuery('/v1/schedule-assignments', { company_id: companyId }), session.access_token),
+      api<{ data: EmployeeSchedulePlan[] }>(withQuery('/v1/employee-schedule-plans', { company_id: companyId }), session.access_token),
+      api<{ data: Terminal[] }>(withQuery('/v1/terminals', { company_id: companyId }), session.access_token),
+    ]).then(([attendance, occurrences, bank, punches, adjustments, employees, employeeLocations, locations, schedules, scheduleAssignments, dailyPlans, terminals]) => {
+      if (active) setData({ days: attendance.data, occurrences: occurrences.data, bank: bank.data, balance: bank.balance_minutes, punches: punches.data, adjustments: adjustments.data, employees: employees.data, employeeLocations: employeeLocations.data, locations: locations.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data, terminals: terminals.data });
+    }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar os dados.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [session.access_token, companyId, from, to, refresh]);
+  const selectedCompany = useMemo(() => me?.memberships.find((item) => item.company_id === companyId)?.companies, [companyId, me]);
+  const openOccurrences = data?.occurrences.filter((item) => item.status === 'open').length ?? 0;
+  if (loading && !data) return <main className="centered">Carregando painel…</main>;
+  return <main className="shell"><header><div><p className="eyebrow">FACEPONTO</p><h1>{selectedCompany?.name ?? 'Painel administrativo'}</h1></div>
+    <div className="header-actions"><button className="secondary" onClick={() => setRefresh((value) => value + 1)}>Atualizar</button><button className="secondary" onClick={onLogout}>Sair</button></div></header>
+    {error && <p className="notice error">{error}</p>}
+    {!me?.memberships.length ? <p className="notice">Esta conta ainda não possui uma empresa. Crie uma conta nova para iniciar uma empresa local.</p> : <>
+      <section className="filters" aria-label="Filtros"><label>Empresa<select value={companyId} onChange={(event) => setCompanyId(event.target.value)}>{me.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label>
+        <label>De<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>Até<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label></section>
+      <ReportDownloads companyId={companyId} from={from} to={to} token={session.access_token} />
+      <section className="metrics"><Metric label="Jornadas" value={String(data?.days.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label="Saldo no período" value={minutes(data?.balance)} /></section>
+      <section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section>
+      <section className="grid employees-grid"><Employees values={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
+      <FacialProfileProvisioning employees={data?.employees ?? []} companyId={companyId} token={session.access_token} />
+      <EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
+      <Terminals values={data?.terminals ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <ScheduleAssignment companyId={companyId} employees={data?.employees ?? []} schedules={data?.schedules ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <DailySchedulePlans values={data?.dailyPlans ?? []} employees={data?.employees ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <ScheduleAssignments values={data?.scheduleAssignments ?? []} employees={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <AdjustmentForm companyId={companyId} punches={data?.punches ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <Adjustments values={data?.adjustments ?? []} />
+    </>}
+  </main>;
+}
+
+function Metric({ label, value }: { label: string; value: string }) { return <article className="metric"><span>{label}</span><strong>{value}</strong></article>; }
+function ReportDownloads({ companyId, from, to, token }: { companyId: string; from: string; to: string; token: string }) {
+  const [message, setMessage] = useState(''); const [pending, setPending] = useState<'xlsx' | 'pdf' | null>(null);
+  async function download(format: 'xlsx' | 'pdf') {
+    setPending(format); setMessage('');
+    try {
+      const response = await fetch(withQuery('/v1/reports/attendance', { company_id: companyId, date_from: from || undefined, date_to: to || undefined, format }), { headers: { authorization: `Bearer ${token}` } });
+      if (!response.ok) throw new Error('Não foi possível gerar o relatório.');
+      const blob = await response.blob(); const url = URL.createObjectURL(blob); const anchor = document.createElement('a');
+      anchor.href = url; anchor.download = `faceponto-jornadas.${format}`; anchor.click(); URL.revokeObjectURL(url);
+      setMessage(`Relatório ${format.toUpperCase()} baixado.`);
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Não foi possível gerar o relatório.'); }
+    finally { setPending(null); }
+  }
+  return <section className="report-downloads"><div><strong>Relatórios</strong><span>Exporta o mesmo período e totais das jornadas exibidas.</span></div><div className="report-actions"><button className="secondary" disabled={pending !== null} onClick={() => void download('xlsx')}>{pending === 'xlsx' ? 'Gerando…' : 'Baixar XLSX'}</button><button disabled={pending !== null} onClick={() => void download('pdf')}>{pending === 'pdf' ? 'Gerando…' : 'Baixar PDF'}</button></div>{message && <p className="form-message">{message}</p>}</section>;
+}
+function Journeys({ days }: { days: WorkDay[] }) { return <section className="panel"><h2>Jornadas</h2><div className="table-wrap"><table><thead><tr><th>Data</th><th>Estado</th><th>Trabalhado</th><th>Saldo</th></tr></thead><tbody>{days.map((day) => { const result = currentCalculation(day); return <tr key={day.id}><td>{day.local_date}</td><td><span className={`pill ${result?.state ?? ''}`}>{result?.state ?? 'sem cálculo'}</span></td><td>{minutes(result?.worked_minutes)}</td><td>{minutes(result?.net_balance_minutes)}</td></tr>; })}{!days.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
+function Occurrences({ values, companyId, token, onSaved }: { values: Occurrence[]; companyId: string; token: string; onSaved: () => void }) { return <section className="panel"><h2>Ocorrências</h2><div className="table-wrap"><table><thead><tr><th>Tipo</th><th>Gravidade</th><th>Status</th><th>Ação</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <OccurrenceRow key={item.id} occurrence={item} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
+function OccurrenceRow({ occurrence, companyId, token, onSaved }: { occurrence: Occurrence; companyId: string; token: string; onSaved: () => void }) {
+  const [resolution, setResolution] = useState(''); const [pending, setPending] = useState(false); const [message, setMessage] = useState('');
+  async function resolve() {
+    setPending(true); setMessage('');
+    try { await api(`/v1/occurrences/${occurrence.id}/resolution`, token, { method: 'POST', body: JSON.stringify({ company_id: companyId, resolution }) }); setMessage('Ocorrência resolvida.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível resolver a ocorrência.'); }
+    finally { setPending(false); }
+  }
+  return <tr><td>{occurrence.type}</td><td><span className={`pill ${occurrence.severity}`}>{occurrence.severity}</span></td><td>{occurrence.status}</td><td>{occurrence.status === 'resolved' ? occurrence.resolution ?? 'Resolvida' : <div className="occurrence-actions"><input aria-label={`Resolução para ${occurrence.type}`} maxLength={500} placeholder="Motivo da resolução" value={resolution} onChange={(event) => setResolution(event.target.value)} /><button className="secondary small-button" disabled={pending || !resolution.trim()} onClick={() => void resolve()}>{pending ? 'Salvando…' : 'Resolver'}</button>{message && <p className="row-message">{message}</p>}</div>}</td></tr>;
+}
+function Bank({ values }: { values: BankEntry[] }) { return <section className="panel"><h2>Banco de horas</h2><div className="table-wrap"><table><thead><tr><th>Quando</th><th>Motivo</th><th>Saldo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{dateTime(item.created_at)}</td><td>{item.reason}</td><td>{minutes(item.delta_minutes)}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div></section>; }
+function Empty({ colSpan }: { colSpan: number }) { return <tr><td colSpan={colSpan} className="empty">Nenhum registro para este filtro.</td></tr>; }
+function Adjustments({ values }: { values: PunchAdjustment[] }) { return <section className="panel adjustments"><h2>Correções recentes</h2><div className="table-wrap"><table><thead><tr><th>Registrada</th><th>Novo horário</th><th>Motivo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{dateTime(item.created_at)}</td><td>{dateTime(item.corrected_timestamp)}</td><td>{item.reason}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div></section>; }
+function Employees({ values, companyId, token, onSaved }: { values: Employee[]; companyId: string; token: string; onSaved: () => void }) { return <section className="panel employees"><h2>Funcionários ativos</h2><div className="table-wrap"><table><thead><tr><th>Matrícula</th><th>Nome</th><th>Cargo</th><th></th></tr></thead><tbody>{values.slice(0, 12).map((item) => <EmployeeRow key={item.id} employee={item} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
+function EmployeeRow({ employee, companyId, token, onSaved }: { employee: Employee; companyId: string; token: string; onSaved: () => void }) {
+  const [pending, setPending] = useState(false); const [message, setMessage] = useState('');
+  async function deactivate() {
+    setPending(true); setMessage('');
+    try { await api(`/v1/employees/${employee.id}`, token, { method: 'PATCH', body: JSON.stringify({ company_id: companyId, expected_version: employee.version, active: false }) }); setMessage('Funcionário desativado.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível desativar o funcionário.'); }
+    finally { setPending(false); }
+  }
+  return <tr><td>{employee.registration}</td><td>{employee.name}</td><td>{employee.job_title || '—'}</td><td><button className="secondary small-button" disabled={pending} onClick={() => void deactivate()}>Desativar</button>{message && <p className="row-message">{message}</p>}</td></tr>;
+}
+function FacialProfileProvisioning({ employees, companyId, token }: { employees: Employee[]; companyId: string; token: string }) {
+  const [employeeId, setEmployeeId] = useState(''); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  useEffect(() => { if (!employees.some((item) => item.id === employeeId)) setEmployeeId(employees[0]?.id ?? ''); }, [employees, employeeId]);
+  async function provision(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    try {
+      const profile = await api<{ version: number }>('/v1/facial-profiles', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employeeId }) });
+      setMessage(`Perfil de teste versão ${profile.version} provisionado. Abra o terminal para atualizar o catálogo.`);
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível provisionar o perfil.'); }
+    finally { setPending(false); }
+  }
+  return <section className="panel facial-profile"><h2>Perfil facial de teste</h2><p>Depois de cadastrar a amostra no terminal, provisione a versão do perfil aqui. A amostra biométrica continua somente no aparelho; este registro guarda apenas a versão e os modelos aceitos para validação do ponto.</p><form onSubmit={provision} className="inline-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !employeeId}>{pending ? 'Provisionando…' : 'Provisionar para teste'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
+}
+function EmployeeLocations({ values, employees, locations, companyId, token, onSaved }: { values: EmployeeLocation[]; employees: Employee[]; locations: Location[]; companyId: string; token: string; onSaved: () => void }) {
+  const [employeeId, setEmployeeId] = useState(''); const [locationId, setLocationId] = useState(''); const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  const activeLocations = locations.filter((item) => item.active);
+  useEffect(() => { if (!employees.some((item) => item.id === employeeId)) setEmployeeId(employees[0]?.id ?? ''); if (!activeLocations.some((item) => item.id === locationId)) setLocationId(activeLocations[0]?.id ?? ''); }, [employees, activeLocations, employeeId, locationId]);
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    try {
+      await api('/v1/employee-locations', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employeeId, location_id: locationId, valid_from: `${date}T00:00:00-03:00` }) });
+      setMessage('Local adicional autorizado para este funcionário.'); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível autorizar o local.'); }
+    finally { setPending(false); }
+  }
+  const name = (id: string) => employees.find((item) => item.id === id)?.name ?? id.slice(0, 8);
+  const locationName = (id: string) => locations.find((item) => item.id === id)?.name ?? id.slice(0, 8);
+  return <section className="panel employee-locations"><h2>Autorizar outros locais</h2><p>O local principal continua definido no cadastro. Os vínculos abaixo permitem registrar ponto em outros locais a partir da data informada.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Local autorizado</th><th>Válido desde</th></tr></thead><tbody>{values.map((item) => <tr key={item.id}><td>{name(item.employee_id)}</td><td>{locationName(item.location_id)}</td><td>{dateTime(item.valid_from)}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div><form onSubmit={submit} className="inline-form employee-location-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Local adicional<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Válido desde<input required type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><button disabled={pending || !employeeId || !locationId}>{pending ? 'Salvando…' : 'Autorizar local'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
+}
+function EmployeeForm({ companyId, locations, token, onSaved }: { companyId: string; locations: Location[]; token: string; onSaved: () => void }) {
+  const [registration, setRegistration] = useState(''); const [name, setName] = useState(''); const [jobTitle, setJobTitle] = useState(''); const [locationId, setLocationId] = useState('');
+  const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  const activeLocations = locations.filter((item) => item.active);
+  useEffect(() => { if (!activeLocations.some((item) => item.id === locationId)) setLocationId(activeLocations[0]?.id ?? ''); }, [companyId, locations, locationId, activeLocations]);
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    try {
+      await api('/v1/employees', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, registration, name, job_title: jobTitle, home_location_id: locationId }) });
+      setMessage('Funcionário cadastrado.'); setRegistration(''); setName(''); setJobTitle(''); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível cadastrar o funcionário.'); }
+    finally { setPending(false); }
+  }
+  return <section className="panel employee-form"><h2>Novo funcionário</h2><form onSubmit={submit}><label>Matrícula<input required maxLength={40} value={registration} onChange={(event) => setRegistration(event.target.value)} /></label><label>Nome<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><label>Cargo<input maxLength={160} value={jobTitle} onChange={(event) => setJobTitle(event.target.value)} /></label><label>Local principal<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Cadastre um local pela API primeiro</option>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !locationId}>{pending ? 'Salvando…' : 'Cadastrar funcionário'}</button>{message && <p className="form-message">{message}</p>}</form></section>;
+}
+function Locations({ values, companyId, token, onSaved }: { values: Location[]; companyId: string; token: string; onSaved: () => void }) {
+  const [name, setName] = useState(''); const [message, setMessage] = useState('');
+  async function submit(event: FormEvent) { event.preventDefault(); try { await api('/v1/locations', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, name }) }); setName(''); setMessage('Local cadastrado.'); onSaved(); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível cadastrar o local.'); } }
+  return <section className="panel"><h2>Locais</h2><ul className="simple-list">{values.map((item) => <LocationRow key={item.id} location={item} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <li>Nenhum local cadastrado.</li>}</ul><form onSubmit={submit} className="inline-form"><label>Novo local<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><button>Cadastrar local</button></form>{message && <p className="form-message">{message}</p>}</section>;
+}
+function LocationRow({ location, companyId, token, onSaved }: { location: Location; companyId: string; token: string; onSaved: () => void }) {
+  const [pending, setPending] = useState(false); const [message, setMessage] = useState('');
+  async function toggle() {
+    setPending(true); setMessage('');
+    try { await api(`/v1/locations/${location.id}`, token, { method: 'PATCH', body: JSON.stringify({ company_id: companyId, expected_version: location.version, active: !location.active }) }); setMessage(location.active ? 'Local desativado.' : 'Local ativado.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível atualizar o local.'); }
+    finally { setPending(false); }
+  }
+  return <li className="managed-list-row"><span>{location.name}</span><button className="secondary small-button" disabled={pending} onClick={() => void toggle()}>{location.active ? 'Desativar' : 'Ativar'}</button>{message && <small>{message}</small>}</li>;
+}
+function Terminals({ values, locations, companyId, token, onSaved }: { values: Terminal[]; locations: Location[]; companyId: string; token: string; onSaved: () => void }) {
+  const [code, setCode] = useState(''); const [name, setName] = useState(''); const [locationId, setLocationId] = useState('');
+  const [message, setMessage] = useState(''); const [pairing, setPairing] = useState<{ terminalId: string; code: string; expiresAt: number } | null>(null); const [pending, setPending] = useState(false);
+  const activeLocations = locations.filter((item) => item.active);
+  useEffect(() => { if (!activeLocations.some((item) => item.id === locationId)) setLocationId(activeLocations[0]?.id ?? ''); }, [locations, locationId, activeLocations]);
+  async function create(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    try {
+      await api('/v1/terminals', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, location_id: locationId, code, name }) });
+      setCode(''); setName(''); setMessage('Terminal cadastrado. Gere o código somente quando o celular estiver pronto.'); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível cadastrar o terminal.'); }
+    finally { setPending(false); }
+  }
+  async function generatePairing(terminalId: string) {
+    setMessage(''); setPairing(null);
+    try {
+      const result = await api<{ code: string; expires_in_seconds: number }>(`/v1/terminals/${terminalId}/pairing`, token, { method: 'POST' });
+      setPairing({ terminalId, code: result.code, expiresAt: Date.now() + result.expires_in_seconds * 1_000 });
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível gerar o código.'); }
+  }
+  return <section className="panel terminals"><h2>Terminais</h2><p>Cadastre o relógio agora. O código de pareamento só deve ser gerado quando o aplicativo estiver aberto no celular, pois expira em 10 minutos.</p>
+    <div className="table-wrap"><table><thead><tr><th>Código</th><th>Nome</th><th>Local</th><th>Estado</th><th>Ações</th></tr></thead><tbody>{values.map((item) => <TerminalRow key={item.id} terminal={item} locations={locations} companyId={companyId} token={token} onSaved={onSaved} onPair={() => void generatePairing(item.id)} pairing={pairing?.terminalId === item.id ? pairing : null} />)}{!values.length && <Empty colSpan={5} />}</tbody></table></div>
+    <form onSubmit={create} className="inline-form terminal-form"><label>Código interno<input required maxLength={64} value={code} onChange={(event) => setCode(event.target.value)} placeholder="RELOGIO-01" /></label><label>Nome<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} placeholder="Recepção" /></label><label>Local<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Cadastre um local primeiro</option>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !locationId}>{pending ? 'Salvando…' : 'Cadastrar terminal'}</button></form>{message && <p className="form-message">{message}</p>}
+  </section>;
+}
+function TerminalRow({ terminal, locations, companyId, token, onSaved, onPair, pairing }: { terminal: Terminal; locations: Location[]; companyId: string; token: string; onSaved: () => void; onPair: () => void; pairing: { code: string; expiresAt: number } | null }) {
+  const [newLocationId, setNewLocationId] = useState(terminal.location_id); const [pending, setPending] = useState(false); const [message, setMessage] = useState('');
+  const currentLocation = locations.find((location) => location.id === terminal.location_id)?.name ?? terminal.location_id.slice(0, 8);
+  async function reassign() {
+    if (newLocationId === terminal.location_id) return;
+    setPending(true); setMessage('');
+    try {
+      await api(`/v1/terminals/${terminal.id}/reassign`, token, { method: 'POST', body: JSON.stringify({ company_id: companyId, new_location_id: newLocationId, expected_version: terminal.version, effective_at: new Date().toISOString() }) });
+      setMessage('Terminal reassociado.'); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível reassociar o terminal.'); }
+    finally { setPending(false); }
+  }
+  async function toggleActive() {
+    setPending(true); setMessage('');
+    try {
+      await api(`/v1/terminals/${terminal.id}`, token, { method: 'PATCH', body: JSON.stringify({ company_id: companyId, expected_version: terminal.version, active: !terminal.active }) });
+      setMessage(terminal.active ? 'Terminal desativado.' : 'Terminal ativado.'); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível atualizar o terminal.'); }
+    finally { setPending(false); }
+  }
+  return <tr><td>{terminal.code}</td><td>{terminal.name}</td><td>{currentLocation}<select className="location-select" aria-label={`Novo local para ${terminal.name}`} value={newLocationId} onChange={(event) => setNewLocationId(event.target.value)} disabled={pending}>{locations.filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className="secondary small-button" disabled={pending || newLocationId === terminal.location_id} onClick={() => void reassign()}>Mover</button></td><td>{terminal.active ? (terminal.last_heartbeat_at ? `visto ${dateTime(terminal.last_heartbeat_at)}` : 'aguardando pareamento') : 'desativado'}</td><td><div className="terminal-actions"><button className="secondary small-button" disabled={pending || !terminal.active} onClick={onPair}>Gerar código</button><button className="secondary small-button" disabled={pending} onClick={() => void toggleActive()}>{terminal.active ? 'Desativar' : 'Ativar'}</button>{pairing && <p className="pairing-code"><strong>{pairing.code}</strong><br />Expira às {new Date(pairing.expiresAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</p>}{message && <p className="row-message">{message}</p>}</div></td></tr>;
+}
+function Schedules({ values, companyId, token, onSaved }: { values: Schedule[]; companyId: string; token: string; onSaved: () => void }) {
+  const [name, setName] = useState(''); const [weekdays, setWeekdays] = useState<number[]>([1, 2, 3, 4, 5]); const [segments, setSegments] = useState([{ id: 1, start: '08:00', end: '17:00', nextDay: false }]); const [message, setMessage] = useState('');
+  const toMinute = (value: string) => { const [hours = 0, minutes = 0] = value.split(':').map(Number); return hours * 60 + minutes; };
+  const formatMinute = (value: number) => `${String(Math.floor((value % 1440) / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}${value >= 1440 ? ' (+1 dia)' : ''}`;
+  function updateSegment(id: number, field: 'start' | 'end' | 'nextDay', value: string | boolean) { setSegments((current) => current.map((item) => item.id === id ? { ...item, [field]: value } : item)); }
+  function toggleWeekday(day: number) { setWeekdays((current) => current.includes(day) ? current.filter((item) => item !== day) : [...current, day].sort((a, b) => a - b)); }
+  function addSegment() { setSegments((current) => [...current, { id: Math.max(...current.map((item) => item.id)) + 1, start: '14:00', end: '18:00', nextDay: false }]); }
+  function removeSegment(id: number) { setSegments((current) => current.length > 1 ? current.filter((item) => item.id !== id) : current); }
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setMessage('');
+    const payloadSegments = segments.map((item, index) => ({ ordinal: index + 1, start_minute: toMinute(item.start), end_minute: toMinute(item.end) + (item.nextDay ? 1440 : 0) }));
+    if (!weekdays.length || payloadSegments.some((item) => item.end_minute <= item.start_minute)) { setMessage('Selecione ao menos um dia e informe períodos com saída posterior à entrada.'); return; }
+    try { await api('/v1/schedules', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, name, timezone: 'America/Fortaleza', rules: { late_tolerance_minutes: 5, overtime_tolerance_minutes: 5, missing_punch_grace_minutes: 60 }, weekdays, segments: payloadSegments }) }); setName(''); setWeekdays([1, 2, 3, 4, 5]); setSegments([{ id: 1, start: '08:00', end: '17:00', nextDay: false }]); setMessage('Escala criada.'); onSaved(); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível criar a escala.'); }
+  }
+  const dayLabels = [{ day: 1, label: 'Seg' }, { day: 2, label: 'Ter' }, { day: 3, label: 'Qua' }, { day: 4, label: 'Qui' }, { day: 5, label: 'Sex' }, { day: 6, label: 'Sáb' }, { day: 7, label: 'Dom' }];
+  return <section className="panel schedules"><h2>Escalas</h2><ul className="simple-list">{values.map((item) => <li key={item.id}><strong>{item.name}</strong>{item.schedule_versions[0] && <small>{item.schedule_versions[0].schedule_segments.map((segment) => `${formatMinute(segment.start_minute)}–${formatMinute(segment.end_minute)}`).join(' · ')}</small>}</li>)}{!values.length && <li>Nenhuma escala cadastrada.</li>}</ul><form onSubmit={submit} className="schedule-editor"><label>Nome da escala<input required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} placeholder="Ex.: Administrativo com intervalo" /></label><fieldset className="weekday-picker"><legend>Dias de trabalho</legend>{dayLabels.map(({ day, label }) => <label key={day}><input type="checkbox" checked={weekdays.includes(day)} onChange={() => toggleWeekday(day)} />{label}</label>)}</fieldset><div className="segment-editor"><strong>Períodos trabalhados</strong>{segments.map((segment, index) => <div className="segment-row" key={segment.id}><span>{index + 1}.</span><label>Entrada<input type="time" required value={segment.start} onChange={(event) => updateSegment(segment.id, 'start', event.target.value)} /></label><label>Saída<input type="time" required value={segment.end} onChange={(event) => updateSegment(segment.id, 'end', event.target.value)} /></label><label className="next-day"><input type="checkbox" checked={segment.nextDay} onChange={(event) => updateSegment(segment.id, 'nextDay', event.target.checked)} />Termina no dia seguinte</label><button type="button" className="secondary small-button" disabled={segments.length === 1} onClick={() => removeSegment(segment.id)}>Remover</button></div>)}<button type="button" className="secondary add-segment" disabled={segments.length >= 12} onClick={addSegment}>Adicionar período</button></div><button>Criar escala</button></form>{message && <p className="form-message">{message}</p>}</section>;
+}
+function ScheduleAssignment({ companyId, employees, schedules, token, onSaved }: { companyId: string; employees: Employee[]; schedules: Schedule[]; token: string; onSaved: () => void }) {
+  const [employeeId, setEmployeeId] = useState(''); const [versionId, setVersionId] = useState(''); const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); const [message, setMessage] = useState('');
+  const versions = schedules.flatMap((schedule) => schedule.schedule_versions.map((version) => ({ id: version.id, label: `${schedule.name} · versão ${version.version}` })));
+  useEffect(() => { if (!employees.some((item) => item.id === employeeId)) setEmployeeId(employees[0]?.id ?? ''); if (!versions.some((item) => item.id === versionId)) setVersionId(versions[0]?.id ?? ''); }, [employees, versions, employeeId, versionId]);
+  async function submit(event: FormEvent) { event.preventDefault(); try { await api('/v1/schedule-assignments', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employeeId, schedule_version_id: versionId, valid_from: `${date}T00:00:00-03:00` }) }); setMessage('Escala atribuída ao funcionário.'); onSaved(); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível atribuir a escala.'); } }
+  return <section className="panel assignment"><h2>Atribuir escala</h2><form onSubmit={submit} className="inline-form assignment-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Escala<select required value={versionId} onChange={(event) => setVersionId(event.target.value)}>{versions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><label>Válida desde<input required type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><button disabled={!employeeId || !versionId}>Atribuir</button></form>{message && <p className="form-message">{message}</p>}</section>;
+}
+function DailySchedulePlans({ values, employees, schedules, companyId, token, onSaved }: { values: EmployeeSchedulePlan[]; employees: Employee[]; schedules: Schedule[]; companyId: string; token: string; onSaved: () => void }) {
+  const [employeeId, setEmployeeId] = useState(''); const [versionId, setVersionId] = useState(''); const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  const versions = schedules.flatMap((schedule) => schedule.schedule_versions.map((version) => ({ id: version.id, label: `${schedule.name} · versão ${version.version}` })));
+  useEffect(() => { if (!employees.some((item) => item.id === employeeId)) setEmployeeId(employees[0]?.id ?? ''); if (!versions.some((item) => item.id === versionId)) setVersionId(versions[0]?.id ?? ''); }, [employees, versions, employeeId, versionId]);
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    const existing = values.find((item) => item.employee_id === employeeId && item.local_date === date);
+    try { await api('/v1/employee-schedule-plans', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employeeId, local_date: date, schedule_version_id: versionId, expected_version: existing?.version }) }); setMessage(existing ? 'Programação diária atualizada.' : 'Programação diária criada.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível salvar a programação diária.'); }
+    finally { setPending(false); }
+  }
+  return <section className="panel daily-plans"><h2>Programação diária</h2><p>Use somente nos dias que fogem da escala padrão. Ela tem prioridade naquela data e não altera o vínculo fixo do funcionário.</p><div className="table-wrap"><table><thead><tr><th>Data</th><th>Funcionário</th><th>Escala do dia</th><th>Ação</th></tr></thead><tbody>{values.map((item) => <DailySchedulePlanRow key={item.id} plan={item} employee={employees.find((candidate) => candidate.id === item.employee_id)} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <Empty colSpan={4} />}</tbody></table></div><form onSubmit={submit} className="daily-plan-form"><label>Data<input required type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Escala do dia<select required value={versionId} onChange={(event) => setVersionId(event.target.value)}>{versions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><button disabled={pending || !employeeId || !versionId}>{pending ? 'Salvando…' : 'Programar dia'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
+}
+function DailySchedulePlanRow({ plan, employee, companyId, token, onSaved }: { plan: EmployeeSchedulePlan; employee: Employee | undefined; companyId: string; token: string; onSaved: () => void }) {
+  const [pending, setPending] = useState(false); const [message, setMessage] = useState(''); const schedule = plan.schedule_versions?.work_schedules?.name ?? 'Escala removida';
+  async function clear() {
+    setPending(true); setMessage('');
+    try { await api(`/v1/employee-schedule-plans/${plan.id}`, token, { method: 'DELETE', body: JSON.stringify({ company_id: companyId, expected_version: plan.version }) }); setMessage('Programação diária removida.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível remover a programação diária.'); }
+    finally { setPending(false); }
+  }
+  return <tr><td>{plan.local_date}</td><td>{employee?.name ?? plan.employee_id.slice(0, 8)}</td><td>{schedule} · versão {plan.schedule_versions?.version ?? '—'}</td><td><button className="secondary small-button" disabled={pending} onClick={() => void clear()}>{pending ? 'Salvando…' : 'Usar escala padrão'}</button>{message && <p className="row-message">{message}</p>}</td></tr>;
+}
+function ScheduleAssignments({ values, employees, companyId, token, onSaved }: { values: ScheduleAssignmentRecord[]; employees: Employee[]; companyId: string; token: string; onSaved: () => void }) {
+  return <section className="panel schedule-assignments"><h2>Vínculos de escala</h2><p>Um vínculo ativo vale até ser encerrado. A nova escala deve começar depois do encerramento.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Escala</th><th>Vigência</th><th>Ação</th></tr></thead><tbody>{values.map((item) => <ScheduleAssignmentRow key={item.id} assignment={item} employee={employees.find((candidate) => candidate.id === item.employee_id)} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>;
+}
+function ScheduleAssignmentRow({ assignment, employee, companyId, token, onSaved }: { assignment: ScheduleAssignmentRecord; employee: Employee | undefined; companyId: string; token: string; onSaved: () => void }) {
+  const minDate = assignment.valid_from.slice(0, 10);
+  const suggestedDate = new Date(`${minDate}T12:00:00`); suggestedDate.setDate(suggestedDate.getDate() + 1);
+  const [validTo, setValidTo] = useState(suggestedDate.toISOString().slice(0, 10)); const [pending, setPending] = useState(false); const [message, setMessage] = useState('');
+  const schedule = assignment.schedule_versions?.work_schedules?.name ?? 'Escala removida';
+  async function close() {
+    setPending(true); setMessage('');
+    try {
+      await api(`/v1/schedule-assignments/${assignment.id}/close`, token, { method: 'PATCH', body: JSON.stringify({ company_id: companyId, valid_to: `${validTo}T00:00:00-03:00` }) });
+      setMessage('Vínculo encerrado.'); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível encerrar o vínculo.'); }
+    finally { setPending(false); }
+  }
+  return <tr><td>{employee?.name ?? assignment.employee_id.slice(0, 8)}</td><td>{schedule} · versão {assignment.schedule_versions?.version ?? '—'}</td><td>{assignment.valid_from.slice(0, 10)}{assignment.valid_to ? ` até ${assignment.valid_to.slice(0, 10)}` : ' · ativa'}</td><td>{assignment.valid_to ? 'Encerrada' : <div className="assignment-actions"><input aria-label={`Data de encerramento de ${employee?.name ?? assignment.employee_id}`} type="date" min={minDate} value={validTo} onChange={(event) => setValidTo(event.target.value)} /><button className="secondary small-button" disabled={pending || validTo <= minDate} onClick={() => void close()}>{pending ? 'Salvando…' : 'Encerrar'}</button>{message && <p className="row-message">{message}</p>}</div>}</td></tr>;
+}
+
+function AdjustmentForm({ companyId, punches, token, onSaved }: { companyId: string; punches: Punch[]; token: string; onSaved: () => void }) {
+  const [punchId, setPunchId] = useState(''); const [timestamp, setTimestamp] = useState(''); const [reason, setReason] = useState('');
+  const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  const accepted = punches.filter((item) => item.sync_status === 'accepted');
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    try {
+      await api(`/v1/punches/${punchId}/adjustments`, token, { method: 'POST', body: JSON.stringify({ company_id: companyId, corrected_timestamp: new Date(timestamp).toISOString(), reason }) });
+      setMessage('Correção registrada e jornada enviada para recálculo.'); setReason(''); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível registrar a correção.'); }
+    finally { setPending(false); }
+  }
+  return <section className="panel adjustment"><h2>Corrigir batida</h2><p>A batida original não é alterada. Informe o motivo para criar uma correção auditável.</p>
+    <form onSubmit={submit} className="adjustment-form"><label>Batida<select required value={punchId} onChange={(event) => setPunchId(event.target.value)}><option value="">Selecione uma batida aceita</option>{accepted.map((item) => <option key={item.id} value={item.id}>{dateTime(item.timestamp)} · {item.employee_id.slice(0, 8)}</option>)}</select></label>
+      <label>Novo horário<input required type="datetime-local" value={timestamp} onChange={(event) => setTimestamp(event.target.value)} /></label><label>Motivo<textarea required minLength={1} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+      <button disabled={pending || !accepted.length}>{pending ? 'Salvando…' : 'Registrar correção'}</button>{message && <p className="form-message">{message}</p>}
+    </form></section>;
+}

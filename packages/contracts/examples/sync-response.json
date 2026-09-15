@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "server_timestamp": "2026-09-13T12:00:00.000Z",
+  "results": [{
+    "id": "a10e0500-0406-4d15-9098-1409a7cce111",
+    "status": "quarantined",
+    "receipt_id": "a70e0500-0406-4d15-9098-1409a7cce777",
+    "code": "CLOCK_UNVERIFIED"
+  }]
+}

@@ -1,0 +1,22 @@
+{
+  "protocol_version": 1,
+  "events": [{
+    "id": "a10e0500-0406-4d15-9098-1409a7cce111",
+    "employee_id": "b20e0500-0406-4d15-9098-1409a7cce222",
+    "terminal_assignment_id": "c30e0500-0406-4d15-9098-1409a7cce333",
+    "device_timestamp": "2026-09-13T11:02:00.000Z",
+    "device_elapsed_ms": 500000,
+    "boot_id": "d40e0500-0406-4d15-9098-1409a7cce444",
+    "clock_anchor_id": null,
+    "source": "face",
+    "recognition": {
+      "profile_id": "e50e0500-0406-4d15-9098-1409a7cce555",
+      "profile_version": 1,
+      "recognition_model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "liveness_model_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policy_version": 1,
+      "liveness_session_id": "f60e0500-0406-4d15-9098-1409a7cce666",
+      "liveness_result": "passed"
+    }
+  }]
+}

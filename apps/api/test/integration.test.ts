@@ -1,0 +1,559 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { after, before, test } from 'node:test';
+import { createClient } from '@supabase/supabase-js';
+import pg from 'pg';
+import { buildApp } from '../src/app.js';
+import { startAttendanceWorker } from '../src/attendance-worker.js';
+import { loadConfig } from '../src/config.js';
+
+const url = process.env.SUPABASE_URL!;
+const publishable = process.env.SUPABASE_PUBLISHABLE_KEY!;
+const secret = process.env.SUPABASE_SECRET_KEY!;
+const databaseUrl = process.env.TEST_DATABASE_URL!;
+const stamp = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const password = `FacePonto-${stamp}-Aa9!`;
+const emails = [`admin-a-${stamp}@faceponto.test`, `admin-b-${stamp}@faceponto.test`];
+const admin = createClient(url, secret, { auth: { persistSession: false, autoRefreshToken: false } });
+const sql = new pg.Client({ connectionString: databaseUrl });
+const config = loadConfig();
+const app = buildApp(config);
+let tokenA = '';
+let tokenB = '';
+let companyA = '';
+let companyB = '';
+let locationA = '';
+let locationB = '';
+let locationExtraA = '';
+let employeeId = '';
+let terminalId = '';
+let terminalToken = '';
+let scheduleVersionId = '';
+let scheduleAssignmentId = '';
+let acceptedPunchId = '';
+let acceptedPunchTimestamp = '';
+let facialProfileId = '';
+
+async function signUpAndLogin(email: string) {
+  const created = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+  assert.ifError(created.error);
+  const client = createClient(url, publishable, { auth: { persistSession: false, autoRefreshToken: false } });
+  const signed = await client.auth.signInWithPassword({ email, password });
+  assert.ifError(signed.error);
+  return signed.data.session!.access_token;
+}
+async function request(method: string, path: string, token?: string, payload?: unknown): Promise<Awaited<ReturnType<typeof app.inject>>> {
+  return await app.inject({ method, url: path, headers: token ? { authorization: `Bearer ${token}` } : {}, payload } as never);
+}
+
+before(async () => {
+  await sql.connect();
+  tokenA = await signUpAndLogin(emails[0]!);
+  tokenB = await signUpAndLogin(emails[1]!);
+});
+after(async () => {
+  await app.close();
+  const companies = [companyA, companyB].filter(Boolean);
+  await sql.query('begin');
+  try {
+    // Disable audit/immutability triggers only in this test cleanup transaction.
+    await sql.query('set local session_replication_role = replica');
+    for (const table of [
+      'public.audit_logs', 'private.attendance_recalculation_queue', 'public.bank_hours',
+      'public.attendance_occurrences', 'public.attendance_calculations', 'public.work_days',
+      'public.punch_adjustments',
+      'public.time_punches', 'private.clock_anchors', 'private.facial_profiles',
+      'private.terminal_pairings', 'public.terminal_status', 'public.employee_schedule_plans', 'public.schedule_assignments',
+      'public.schedule_segments', 'public.schedule_weekdays', 'public.schedule_versions',
+      'public.work_schedules', 'public.terminal_location_assignments', 'public.employee_locations',
+      'private.employee_documents', 'public.employees', 'public.departments', 'public.member_locations',
+      'public.terminals', 'public.locations', 'public.company_memberships',
+    ]) await sql.query(`delete from ${table} where company_id = any($1)`, [companies]);
+    await sql.query('delete from public.companies where id = any($1)', [companies]);
+    await sql.query('delete from auth.users where email = any($1)', [emails]);
+    await sql.query('commit');
+  } catch (cause) {
+    await sql.query('rollback');
+    throw cause;
+  }
+  await sql.end();
+});
+
+test('health is public, business endpoints require a real Supabase token', async () => {
+  assert.equal((await request('GET', '/health')).statusCode, 200);
+  const denied = await request('GET', '/v1/me');
+  assert.equal(denied.statusCode, 401);
+  assert.equal(denied.json().code, 'UNAUTHORIZED');
+  assert.equal((await request('GET', '/v1/me', 'invalid')).statusCode, 401);
+});
+
+test('two administrators bootstrap isolated companies', async () => {
+  const a = await request('POST', '/v1/companies', tokenA, { name: 'Empresa A', display_name: 'Admin A' });
+  const b = await request('POST', '/v1/companies', tokenB, { name: 'Empresa B', display_name: 'Admin B' });
+  assert.equal(a.statusCode, 201, a.body);
+  assert.equal(b.statusCode, 201, b.body);
+  companyA = a.json().id;
+  companyB = b.json().id;
+  const me = await request('GET', '/v1/me', tokenA);
+  assert.equal(me.statusCode, 200, me.body);
+  assert.deepEqual(me.json().memberships.map((item: { company_id: string }) => item.company_id), [companyA]);
+});
+
+test('employee API obeys RLS and does not disclose another tenant', async () => {
+  const insertA = await request('POST', '/v1/locations', tokenA, { company_id: companyA, name: 'Ponto de Açúcar' });
+  const insertB = await request('POST', '/v1/locations', tokenB, { company_id: companyB, name: 'Local B' });
+  assert.equal(insertA.statusCode, 201, insertA.body); assert.equal(insertB.statusCode, 201, insertB.body);
+  locationA = insertA.json().id; locationB = insertB.json().id;
+  const created = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: 'A01', name: 'Pessoa de Teste', home_location_id: locationA,
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  employeeId = created.json().id;
+  assert.equal(created.json().version, 1);
+  const list = await request('GET', `/v1/employees?company_id=${companyA}&active=true`, tokenA);
+  assert.equal(list.statusCode, 200, list.body);
+  assert.equal(list.json().data.length, 1);
+  const foreignList = await request('GET', `/v1/employees?company_id=${companyA}`, tokenB);
+  assert.equal(foreignList.statusCode, 200, foreignList.body);
+  assert.deepEqual(foreignList.json().data, []);
+  const forbidden = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyB, registration: 'X01', name: 'Tentativa cruzada', home_location_id: locationB,
+  });
+  assert.equal(forbidden.statusCode, 403, forbidden.body);
+  assert.equal(forbidden.json().code, 'FORBIDDEN');
+});
+
+test('employee updates are versioned, auditable and never overwrite stale data', async () => {
+  const updated = await request('PATCH', `/v1/employees/${employeeId}`, tokenA, {
+    company_id: companyA, expected_version: 1, job_title: 'Analista', name: 'Pessoa de Teste Atualizada',
+  });
+  assert.equal(updated.statusCode, 200, updated.body);
+  assert.equal(updated.json().version, 2);
+  assert.equal(updated.json().job_title, 'Analista');
+
+  const stale = await request('PATCH', `/v1/employees/${employeeId}`, tokenA, {
+    company_id: companyA, expected_version: 1, active: false,
+  });
+  assert.equal(stale.statusCode, 409, stale.body);
+  assert.equal(stale.json().code, 'VERSION_CONFLICT');
+
+  const foreign = await request('PATCH', `/v1/employees/${employeeId}`, tokenB, {
+    company_id: companyA, expected_version: 2, active: false,
+  });
+  assert.equal(foreign.statusCode, 409, foreign.body);
+  const unchanged = await request('GET', `/v1/employees?company_id=${companyA}`, tokenA);
+  assert.equal(unchanged.json().data[0].active, true);
+
+  const audit = await sql.query(
+    "select action from public.audit_logs where company_id=$1 and entity_type='employees' and entity_id=$2 order by created_at desc limit 1",
+    [companyA, employeeId],
+  );
+  assert.equal(audit.rows[0].action, 'UPDATE');
+});
+
+test('locations, terminals and schedules are exposed through tenant-scoped API', async () => {
+  const locations = await request('GET', `/v1/locations?company_id=${companyA}`, tokenA);
+  assert.equal(locations.statusCode, 200, locations.body);
+  assert.deepEqual(locations.json().data.map((item: { id: string }) => item.id), [locationA]);
+  const extraLocation = await request('POST', '/v1/locations', tokenA, { company_id: companyA, name: 'Filial' });
+  assert.equal(extraLocation.statusCode, 201, extraLocation.body);
+  locationExtraA = extraLocation.json().id;
+  const terminal = await request('POST', '/v1/terminals', tokenA, {
+    company_id: companyA, location_id: locationA, code: 'T001', name: 'Tablet principal',
+  });
+  assert.equal(terminal.statusCode, 201, terminal.body);
+  terminalId = terminal.json().id;
+  const terminalList = await request('GET', `/v1/terminals?company_id=${companyA}`, tokenA);
+  assert.equal(terminalList.statusCode, 200, terminalList.body);
+  assert.equal(terminalList.json().data[0].code, 'T001');
+  const deniedTerminal = await request('POST', '/v1/terminals', tokenB, {
+    company_id: companyA, location_id: locationA, code: 'X001', name: 'Invasor',
+  });
+  assert.equal(deniedTerminal.statusCode, 403, deniedTerminal.body);
+  const schedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: 'Noturna', timezone: 'America/Fortaleza', weekdays: [1, 2, 3, 4, 5],
+    rules: { late_tolerance_minutes: 5, overtime_tolerance_minutes: 5, missing_punch_grace_minutes: 60 },
+    segments: [{ ordinal: 1, start_minute: 1320, end_minute: 1800 }],
+  });
+  assert.equal(schedule.statusCode, 201, schedule.body);
+  const schedules = await request('GET', `/v1/schedules?company_id=${companyA}`, tokenA);
+  assert.equal(schedules.statusCode, 200, schedules.body);
+  assert.equal(schedules.json().data[0].schedule_versions[0].schedule_segments[0].end_minute, 1800);
+  scheduleVersionId = schedules.json().data[0].schedule_versions[0].id;
+  const invalid = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: 'Inválida', weekdays: [1],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 60 },
+    segments: [{ ordinal: 1, start_minute: 100, end_minute: 200 }, { ordinal: 2, start_minute: 150, end_minute: 250 }],
+  });
+  assert.equal(invalid.statusCode, 422, invalid.body);
+});
+
+test('employee additional locations are tenant-scoped and authorize another workplace', async () => {
+  const created = await request('POST', '/v1/employee-locations', tokenA, {
+    company_id: companyA, employee_id: employeeId, location_id: locationExtraA, valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().location_id, locationExtraA);
+  const listed = await request('GET', `/v1/employee-locations?company_id=${companyA}&employee_id=${employeeId}`, tokenA);
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().data.length, 1);
+  const foreign = await request('POST', '/v1/employee-locations', tokenB, {
+    company_id: companyA, employee_id: employeeId, location_id: locationExtraA, valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(foreign.statusCode, 403, foreign.body);
+  const foreignList = await request('GET', `/v1/employee-locations?company_id=${companyA}`, tokenB);
+  assert.equal(foreignList.statusCode, 200, foreignList.body);
+  assert.deepEqual(foreignList.json().data, []);
+});
+
+test('company, location and terminal administrative updates use optimistic versions', async () => {
+  const company = await request('PATCH', `/v1/companies/${companyA}`, tokenA, {
+    expected_version: 1, name: 'Empresa A Atualizada', timezone: 'America/Sao_Paulo',
+  });
+  assert.equal(company.statusCode, 200, company.body);
+  assert.equal(company.json().version, 2);
+
+  const location = await request('PATCH', `/v1/locations/${locationA}`, tokenA, {
+    company_id: companyA, expected_version: 1, name: 'Matriz Atualizada',
+  });
+  assert.equal(location.statusCode, 200, location.body);
+  assert.equal(location.json().version, 2);
+
+  const terminal = await request('PATCH', `/v1/terminals/${terminalId}`, tokenA, {
+    company_id: companyA, expected_version: 1, name: 'Tablet Atualizado',
+  });
+  assert.equal(terminal.statusCode, 200, terminal.body);
+  assert.equal(terminal.json().version, 2);
+
+  const stale = await request('PATCH', `/v1/terminals/${terminalId}`, tokenA, {
+    company_id: companyA, expected_version: 1, active: false,
+  });
+  assert.equal(stale.statusCode, 409, stale.body);
+  assert.equal(stale.json().code, 'VERSION_CONFLICT');
+  const foreign = await request('PATCH', `/v1/locations/${locationA}`, tokenB, {
+    company_id: companyA, expected_version: 2, active: false,
+  });
+  assert.equal(foreign.statusCode, 403, foreign.body);
+});
+
+test('schedule assignments preserve history, reject overlaps and obey tenant isolation', async () => {
+  const validFrom = '2026-10-01T00:00:00-03:00';
+  const validTo = '2026-11-01T00:00:00-03:00';
+  const current = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employeeId, schedule_version_id: scheduleVersionId,
+    valid_from: '2026-09-01T00:00:00-03:00', valid_to: validFrom,
+  });
+  assert.equal(current.statusCode, 201, current.body);
+  const created = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employeeId, schedule_version_id: scheduleVersionId, valid_from: validFrom,
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  scheduleAssignmentId = created.json().id;
+
+  const listed = await request('GET', `/v1/schedule-assignments?company_id=${companyA}&employee_id=${employeeId}`, tokenA);
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().data[0].id, scheduleAssignmentId);
+  assert.equal(listed.json().data[0].schedule_versions.work_schedules.name, 'Noturna');
+
+  const overlap = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employeeId, schedule_version_id: scheduleVersionId,
+    valid_from: '2026-10-15T00:00:00-03:00',
+  });
+  assert.equal(overlap.statusCode, 422, overlap.body);
+
+  const foreignList = await request('GET', `/v1/schedule-assignments?company_id=${companyA}`, tokenB);
+  assert.equal(foreignList.statusCode, 200, foreignList.body);
+  assert.deepEqual(foreignList.json().data, []);
+  const foreignCreate = await request('POST', '/v1/schedule-assignments', tokenB, {
+    company_id: companyA, employee_id: employeeId, schedule_version_id: scheduleVersionId, valid_from: validFrom,
+  });
+  assert.equal(foreignCreate.statusCode, 403, foreignCreate.body);
+
+  const closed = await request('PATCH', `/v1/schedule-assignments/${scheduleAssignmentId}/close`, tokenA, {
+    company_id: companyA, valid_to: validTo,
+  });
+  assert.equal(closed.statusCode, 200, closed.body);
+  assert.equal(closed.json().valid_to, validTo);
+
+  const replacement = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employeeId, schedule_version_id: scheduleVersionId, valid_from: validTo,
+  });
+  assert.equal(replacement.statusCode, 201, replacement.body);
+  const secondClose = await request('PATCH', `/v1/schedule-assignments/${scheduleAssignmentId}/close`, tokenA, {
+    company_id: companyA, valid_to: '2026-12-01T00:00:00-03:00',
+  });
+  assert.equal(secondClose.statusCode, 422, secondClose.body);
+});
+
+test('daily schedule plans override only the selected date and remain tenant-scoped', async () => {
+  const localDate = '2026-12-02';
+  const created = await request('POST', '/v1/employee-schedule-plans', tokenA, {
+    company_id: companyA, employee_id: employeeId, local_date: localDate, schedule_version_id: scheduleVersionId,
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().active, true);
+  assert.equal(created.json().version, 1);
+  const listed = await request('GET', `/v1/employee-schedule-plans?company_id=${companyA}&employee_id=${employeeId}`, tokenA);
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().data[0].local_date, localDate);
+  assert.equal(listed.json().data[0].schedule_versions.work_schedules.name, 'Noturna');
+  const foreignList = await request('GET', `/v1/employee-schedule-plans?company_id=${companyA}`, tokenB);
+  assert.equal(foreignList.statusCode, 200, foreignList.body);
+  assert.deepEqual(foreignList.json().data, []);
+  const foreignCreate = await request('POST', '/v1/employee-schedule-plans', tokenB, {
+    company_id: companyA, employee_id: employeeId, local_date: '2026-12-03', schedule_version_id: scheduleVersionId,
+  });
+  assert.equal(foreignCreate.statusCode, 403, foreignCreate.body);
+  const updated = await request('POST', '/v1/employee-schedule-plans', tokenA, {
+    company_id: companyA, employee_id: employeeId, local_date: localDate, schedule_version_id: scheduleVersionId, expected_version: 1,
+  });
+  assert.equal(updated.statusCode, 201, updated.body);
+  assert.equal(updated.json().version, 2);
+  const cleared = await request('DELETE', `/v1/employee-schedule-plans/${created.json().id}`, tokenA, {
+    company_id: companyA, expected_version: 2,
+  });
+  assert.equal(cleared.statusCode, 200, cleared.body);
+  assert.equal(cleared.json().active, false);
+});
+
+test('one-time pairing gives the tablet its own identity, heartbeat and scoped catalog', async () => {
+  const pairing = await request('POST', `/v1/terminals/${terminalId}/pairing`, tokenA);
+  assert.equal(pairing.statusCode, 201, pairing.body);
+  assert.ok(pairing.json().code.length >= 32);
+  const paired = await request('POST', '/v1/terminal/pair', undefined, { code: pairing.json().code });
+  assert.equal(paired.statusCode, 201, paired.body);
+  terminalToken = paired.json().access_token;
+  assert.equal(paired.json().terminal_id, terminalId);
+  const identity = await admin.auth.getUser(terminalToken);
+  assert.ifError(identity.error);
+  emails.push(identity.data.user!.email!);
+  const refreshed = await request('POST', '/v1/terminal/refresh', undefined, { refresh_token: paired.json().refresh_token });
+  assert.equal(refreshed.statusCode, 200, refreshed.body);
+  assert.ok(refreshed.json().access_token);
+  assert.ok(refreshed.json().refresh_token);
+  terminalToken = refreshed.json().access_token;
+  const reused = await request('POST', '/v1/terminal/pair', undefined, { code: pairing.json().code });
+  assert.equal(reused.statusCode, 401, reused.body);
+  const heartbeat = await request('POST', '/v1/terminal/heartbeat', terminalToken, { pending_count: 3, app_version: '0.1.0' });
+  assert.equal(heartbeat.statusCode, 200, heartbeat.body);
+  assert.equal(heartbeat.json().terminal_id, terminalId);
+  const catalog = await request('GET', '/v1/terminal/catalog', terminalToken);
+  assert.equal(catalog.statusCode, 200, catalog.body);
+  assert.equal(catalog.json().location_id, locationA);
+  assert.deepEqual(catalog.json().employees.map((employee: { name: string }) => employee.name), ['Pessoa de Teste Atualizada']);
+  const status = await sql.query('select pending_count,app_version from public.terminal_status where terminal_id=$1', [terminalId]);
+  assert.deepEqual(status.rows[0], { pending_count: 3, app_version: '0.1.0' });
+  assert.equal((await sql.query('select version from public.terminals where id=$1', [terminalId])).rows[0].version, 2);
+  assert.equal((await request('GET', '/v1/employees?company_id=' + companyA, terminalToken)).json().data.length, 0);
+});
+
+test('manager provisions versioned facial profile metadata without exposing biometrics', async () => {
+  const forbidden = await request('POST', '/v1/facial-profiles', tokenB, { company_id: companyA, employee_id: employeeId });
+  assert.equal(forbidden.statusCode, 403, forbidden.body);
+  const provisioned = await request('POST', '/v1/facial-profiles', tokenA, { company_id: companyA, employee_id: employeeId });
+  assert.equal(provisioned.statusCode, 201, provisioned.body);
+  facialProfileId = provisioned.json().id;
+  assert.equal(provisioned.json().version, 1);
+  assert.equal(provisioned.json().recognition_model_sha256, '0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79');
+  const catalog = await request('GET', '/v1/terminal/catalog', terminalToken);
+  assert.equal(catalog.statusCode, 200, catalog.body);
+  assert.deepEqual(catalog.json().employees[0].profile_id, facialProfileId);
+  assert.equal(catalog.json().employees[0].profile_version, 1);
+  const stored = await sql.query('select count(*)::int as count from private.facial_profiles where id=$1', [facialProfileId]);
+  assert.equal(stored.rows[0].count, 1);
+});
+
+test('terminal sync verifies clock evidence and is idempotent', async () => {
+  const bootId = randomUUID();
+  const modelHash = '0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79';
+  const livenessHash = '1c2f9ff1f849abfa656da4f7bad4300dc68180c5587056c18808f886d7d1002f';
+  const assignment = await sql.query(
+    'select id from public.terminal_location_assignments where terminal_id=$1 and valid_to is null', [terminalId],
+  );
+  assert.equal(assignment.rowCount, 1);
+
+  const anchor = await request('POST', '/v1/terminal/clock-anchors', terminalToken, {
+    boot_id: bootId, device_elapsed_ms: 1000, uncertainty_ms: 50,
+  });
+  assert.equal(anchor.statusCode, 201, anchor.body);
+  const deviceTimestamp = new Date(new Date(anchor.json().server_timestamp).getTime() + 100).toISOString();
+  const event = {
+    id: randomUUID(), employee_id: employeeId, terminal_assignment_id: assignment.rows[0].id,
+    device_timestamp: deviceTimestamp, device_elapsed_ms: 1100, boot_id: bootId,
+    clock_anchor_id: anchor.json().id, source: 'face',
+    recognition: {
+      profile_id: facialProfileId, profile_version: 1, recognition_model_sha256: modelHash,
+      liveness_model_sha256: livenessHash, policy_version: 1,
+      liveness_session_id: randomUUID(), liveness_result: 'passed',
+    },
+  };
+  const first = await request('POST', '/v1/terminal/sync', terminalToken, { protocol_version: 1, events: [event] });
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(first.json().results[0].status, 'accepted');
+  acceptedPunchId = event.id;
+  acceptedPunchTimestamp = deviceTimestamp;
+  const receiptId = first.json().results[0].receipt_id;
+  const queued = await sql.query('select affected_from,affected_to from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2', [companyA, employeeId]);
+  assert.equal(queued.rowCount, 1);
+  assert.ok(queued.rows[0].affected_from < new Date(deviceTimestamp));
+  assert.ok(queued.rows[0].affected_to > new Date(deviceTimestamp));
+  const stopWorker = startAttendanceWorker({ ...config, ENABLE_ATTENDANCE_WORKER: true });
+  const deadline = Date.now() + 15_000;
+  let processed = false;
+  while (Date.now() < deadline) {
+    const remaining = await sql.query('select count(*)::int as count from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2', [companyA, employeeId]);
+    if (remaining.rows[0].count === 0) { processed = true; break; }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  stopWorker();
+  assert.equal(processed, true, 'attendance worker should drain the durable job');
+  const calculated = await sql.query('select count(*)::int as count from public.attendance_calculations where company_id=$1', [companyA]);
+  assert.ok(calculated.rows[0].count >= 1);
+
+  const retry = await request('POST', '/v1/terminal/sync', terminalToken, { protocol_version: 1, events: [event] });
+  assert.equal(retry.statusCode, 200, retry.body);
+  assert.equal(retry.json().results[0].status, 'already_received');
+  assert.equal(retry.json().results[0].receipt_id, receiptId);
+
+  const conflict = await request('POST', '/v1/terminal/sync', terminalToken, {
+    protocol_version: 1, events: [{ ...event, device_elapsed_ms: 1101 }],
+  });
+  assert.equal(conflict.statusCode, 200, conflict.body);
+  assert.deepEqual(conflict.json().results[0], { id: event.id, status: 'rejected', code: 'IDEMPOTENCY_CONFLICT' });
+
+  const unverified = { ...event, id: randomUUID(), clock_anchor_id: null, recognition: { ...event.recognition, liveness_session_id: randomUUID() } };
+  const quarantine = await request('POST', '/v1/terminal/sync', terminalToken, { protocol_version: 1, events: [unverified] });
+  assert.equal(quarantine.statusCode, 200, quarantine.body);
+  assert.equal(quarantine.json().results[0].status, 'quarantined');
+  assert.equal(quarantine.json().results[0].code, 'CLOCK_UNVERIFIED');
+
+  const punches = await request('GET', `/v1/punches?company_id=${companyA}`, tokenA);
+  assert.equal(punches.statusCode, 200, punches.body);
+  assert.equal(punches.json().data.length, 2);
+  const foreignPunches = await request('GET', `/v1/punches?company_id=${companyA}`, tokenB);
+  assert.equal(foreignPunches.statusCode, 200, foreignPunches.body);
+  assert.deepEqual(foreignPunches.json().data, []);
+});
+
+test('attendance reports export the same tenant-scoped journey data as XLSX and PDF', async () => {
+  const prefix = `/v1/reports/attendance?company_id=${companyA}&date_from=2026-01-01&date_to=2026-12-31`;
+  const xlsx = await request('GET', `${prefix}&format=xlsx`, tokenA);
+  assert.equal(xlsx.statusCode, 200, xlsx.body);
+  assert.match(xlsx.headers['content-type'] ?? '', /spreadsheetml/);
+  assert.match(xlsx.headers['content-disposition'] ?? '', /faceponto-jornadas-2026-01-01_2026-12-31\.xlsx/);
+  assert.deepEqual(xlsx.rawPayload.subarray(0, 2), Buffer.from('PK'));
+  const pdf = await request('GET', `${prefix}&format=pdf`, tokenA);
+  assert.equal(pdf.statusCode, 200, pdf.body);
+  assert.match(pdf.headers['content-type'] ?? '', /application\/pdf/);
+  assert.deepEqual(pdf.rawPayload.subarray(0, 4), Buffer.from('%PDF'));
+  const foreign = await request('GET', `${prefix}&format=pdf`, tokenB);
+  assert.equal(foreign.statusCode, 403, foreign.body);
+  assert.equal(foreign.json().code, 'FORBIDDEN');
+});
+
+test('administrative punch corrections keep the original and trigger an auditable recalculation', async () => {
+  const correctedTimestamp = new Date(new Date(acceptedPunchTimestamp).getTime() + 60_000).toISOString();
+  const before = await sql.query(
+    'select max(revision)::int as revision from public.attendance_calculations where company_id=$1', [companyA],
+  );
+  const created = await request('POST', `/v1/punches/${acceptedPunchId}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: correctedTimestamp, reason: 'Horário conferido pelo RH',
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().original_time_punch_id, acceptedPunchId);
+  const foreign = await request('POST', `/v1/punches/${acceptedPunchId}/adjustments`, tokenB, {
+    company_id: companyA, corrected_timestamp: correctedTimestamp, reason: 'Tentativa cruzada',
+  });
+  assert.equal(foreign.statusCode, 403, foreign.body);
+  const original = await sql.query('select timestamp from public.time_punches where id=$1', [acceptedPunchId]);
+  assert.equal(original.rows[0].timestamp.toISOString(), acceptedPunchTimestamp);
+  const adjustment = await sql.query(
+    'select original_value,new_value,actor_id from public.punch_adjustments where id=$1', [created.json().id],
+  );
+  assert.equal(adjustment.rowCount, 1);
+  assert.equal(new Date(adjustment.rows[0].original_value.timestamp).toISOString(), acceptedPunchTimestamp);
+  assert.equal(new Date(adjustment.rows[0].new_value.timestamp).toISOString(), correctedTimestamp);
+  assert.ok(adjustment.rows[0].actor_id);
+  const listed = await request('GET', `/v1/punch-adjustments?company_id=${companyA}`, tokenA);
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().data.length, 1);
+  const foreignList = await request('GET', `/v1/punch-adjustments?company_id=${companyA}`, tokenB);
+  assert.equal(foreignList.statusCode, 200, foreignList.body);
+  assert.deepEqual(foreignList.json().data, []);
+  const queued = await sql.query('select count(*)::int as count from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2', [companyA, employeeId]);
+  assert.equal(queued.rows[0].count, 1);
+  const stopWorker = startAttendanceWorker({ ...config, ENABLE_ATTENDANCE_WORKER: true });
+  const deadline = Date.now() + 15_000;
+  let processed = false;
+  while (Date.now() < deadline) {
+    const remaining = await sql.query('select count(*)::int as count from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2', [companyA, employeeId]);
+    if (remaining.rows[0].count === 0) { processed = true; break; }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  stopWorker();
+  assert.equal(processed, true, 'correction should be recalculated from the durable queue');
+  const after = await sql.query('select max(revision)::int as revision from public.attendance_calculations where company_id=$1', [companyA]);
+  assert.ok(after.rows[0].revision > before.rows[0].revision);
+  const audit = await sql.query(
+    "select action from public.audit_logs where company_id=$1 and entity_type='punch_adjustments' and entity_id=$2", [companyA, created.json().id],
+  );
+  assert.equal(audit.rows[0].action, 'INSERT');
+});
+
+test('terminal reassignment is atomic and preserves queue status and assignment history', async () => {
+  const newLocation = await request('POST', '/v1/locations', tokenA, { company_id: companyA, name: 'Filial B' });
+  assert.equal(newLocation.statusCode, 201, newLocation.body);
+  const effectiveAt = new Date().toISOString();
+  const foreign = await request('POST', `/v1/terminals/${terminalId}/reassign`, tokenB, {
+    company_id: companyA, new_location_id: newLocation.json().id, expected_version: 2, effective_at: effectiveAt,
+  });
+  assert.equal(foreign.statusCode, 403, foreign.body);
+
+  const moved = await request('POST', `/v1/terminals/${terminalId}/reassign`, tokenA, {
+    company_id: companyA, new_location_id: newLocation.json().id, expected_version: 2, effective_at: effectiveAt,
+  });
+  assert.equal(moved.statusCode, 200, moved.body);
+  assert.equal(moved.json().terminal_version, 3);
+  assert.equal(moved.json().assignment_version, 2);
+
+  const history = await sql.query(
+    'select location_id,version,valid_from,valid_to from public.terminal_location_assignments where terminal_id=$1 order by version', [terminalId],
+  );
+  assert.equal(history.rowCount, 2);
+  assert.equal(history.rows[0].valid_to.toISOString(), history.rows[1].valid_from.toISOString());
+  assert.equal(history.rows[1].location_id, newLocation.json().id);
+  const status = await sql.query('select pending_count,app_version from public.terminal_status where terminal_id=$1', [terminalId]);
+  assert.deepEqual(status.rows[0], { pending_count: 3, app_version: '0.1.0' });
+
+  const stale = await request('POST', `/v1/terminals/${terminalId}/reassign`, tokenA, {
+    company_id: companyA, new_location_id: locationA, expected_version: 2, effective_at: new Date().toISOString(),
+  });
+  assert.equal(stale.statusCode, 409, stale.body);
+});
+
+test('attendance, occurrences and bank-hour queries obey tenant isolation', async () => {
+  for (const path of ['/v1/attendance', '/v1/occurrences', '/v1/bank-hours']) {
+    const own = await request('GET', `${path}?company_id=${companyA}`, tokenA);
+    assert.equal(own.statusCode, 200, own.body);
+    if (path === '/v1/bank-hours') assert.deepEqual(own.json().data, []);
+    else assert.ok(own.json().data.length >= 1);
+    const foreign = await request('GET', `${path}?company_id=${companyA}`, tokenB);
+    assert.equal(foreign.statusCode, 200, foreign.body);
+    assert.deepEqual(foreign.json().data, []);
+  }
+  const bank = await request('GET', `/v1/bank-hours?company_id=${companyA}`, tokenA);
+  assert.equal(bank.json().balance_minutes, 0);
+  const invalidRange = await request('GET', `/v1/attendance?company_id=${companyA}&date_from=2026-09-30&date_to=2026-09-01`, tokenA);
+  assert.equal(invalidRange.statusCode, 400);
+  const missingOccurrence = await request('POST', `/v1/occurrences/${randomUUID()}/resolution`, tokenA, {
+    company_id: companyA, resolution: 'Conferido pelo RH',
+  });
+  assert.equal(missingOccurrence.statusCode, 422);
+});
+
+test('invalid input is rejected before the database', async () => {
+  const response = await request('POST', '/v1/employees', tokenA, { company_id: companyA, name: '' });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().code, 'INVALID_REQUEST');
+  assert.ok(response.json().request_id);
+});
