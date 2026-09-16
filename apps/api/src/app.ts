@@ -313,10 +313,20 @@ export function buildApp(config: ApiConfig) {
   app.get('/v1/terminals', async (request, reply) => {
     const query = tenantQuery.parse(request.query);
     const { data, error: dbError } = await request.auth!.db.from('terminals')
-      .select('id,company_id,location_id,code,name,active,version,last_heartbeat_at,last_sync_at,created_at')
+      .select('id,company_id,location_id,code,name,active,version,created_at,terminal_status(last_heartbeat_at,last_sync_at)')
       .eq('company_id', query.company_id).order('code').limit(200);
     if (dbError) return mapDatabaseError(reply, request, dbError);
-    return { data };
+    const terminals = (data ?? []).map((terminal) => {
+      const rawStatus = terminal.terminal_status;
+      const status = Array.isArray(rawStatus) ? rawStatus[0] : rawStatus;
+      return {
+        id: terminal.id, company_id: terminal.company_id, location_id: terminal.location_id,
+        code: terminal.code, name: terminal.name, active: terminal.active, version: terminal.version,
+        created_at: terminal.created_at, last_heartbeat_at: status?.last_heartbeat_at ?? null,
+        last_sync_at: status?.last_sync_at ?? null,
+      };
+    });
+    return { data: terminals };
   });
   app.post('/v1/terminals', async (request, reply) => {
     const body = terminalBody.parse(request.body);
