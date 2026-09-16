@@ -25,6 +25,9 @@ function inputDate(value: Date) { return value.toISOString().slice(0, 10); }
 function localDayStart(value: string) { return new Date(`${value}T00:00:00`).toISOString(); }
 function localDayAfter(value: string) { const date = new Date(`${value}T00:00:00`); date.setDate(date.getDate() + 1); return date.toISOString(); }
 function currentCalculation(day: WorkDay) { return day.attendance_calculations.find((item) => item.state !== 'superseded') ?? day.attendance_calculations[0]; }
+function fortalezaDate(value: string) { const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Fortaleza', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(value)); const part = (type: string) => parts.find((item) => item.type === type)?.value ?? ''; return `${part('year')}-${part('month')}-${part('day')}`; }
+function fortalezaTime(value: string) { return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Fortaleza', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value)); }
+function dayLabel(value: string) { return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Fortaleza', weekday: 'short', day: '2-digit', month: '2-digit' }).format(new Date(`${value}T12:00:00-03:00`)); }
 
 export function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -184,6 +187,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       <ReportDownloads companyId={companyId} from={from} to={to} token={session.access_token} />
       <section className="metrics"><Metric label="Jornadas" value={String(data?.days.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label="Saldo no período" value={minutes(data?.balance)} /></section>
       <RecentPunches values={data?.punches ?? []} days={data?.days ?? []} />
+      {employeeId && <Timesheet employee={data?.employees.find((item) => item.id === employeeId)} punches={data?.punches ?? []} days={data?.days ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} selectedLocationId={locationId} from={from} to={to} onSaved={() => setRefresh((value) => value + 1)} />}
       <section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section>
       <RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onUseForRegistration={setRegistrationDraft} onSaved={() => setRefresh((value) => value + 1)} />
       <section className="grid employees-grid"><Employees values={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /></section>
@@ -245,6 +249,56 @@ function Bank({ values }: { values: BankEntry[] }) { return <section className="
 function Empty({ colSpan }: { colSpan: number }) { return <tr><td colSpan={colSpan} className="empty">Nenhum registro para este filtro.</td></tr>; }
 function punchKind(value: string) { return ({ entry: 'Entrada', break_start: 'Início do intervalo', break_end: 'Fim do intervalo', exit: 'Saída', unclassified: 'Registrada' } as Record<string, string>)[value] ?? 'Registrada'; }
 function RecentPunches({ values, days }: { values: Punch[]; days: WorkDay[] }) { const calculatedTypes = new Map(days.flatMap((day) => currentCalculation(day)?.classifications ?? []).map((item) => [item.event_id, item.type])); return <section className="panel recent-punches"><h2>Registros de ponto</h2><p>Mostra o funcionário, local e período selecionados acima. A jornada une as batidas da mesma pessoa, mesmo quando ocorrerem em locais diferentes.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Local</th><th>Quando</th><th>Tipo calculado</th><th>Origem</th><th>Status</th></tr></thead><tbody>{values.slice(0, 200).map((item) => <tr key={item.id}><td>{item.employee_name ?? 'Funcionário não localizado'}{item.employee_registration ? ` · ${item.employee_registration}` : ''}</td><td>{item.location_name ?? '—'}</td><td>{dateTime(item.timestamp)}</td><td>{punchKind(calculatedTypes.get(item.id) ?? item.punch_type)}</td><td>{item.source === 'manual' ? 'Inclusa pelo responsável' : 'Reconhecimento facial'}</td><td>{item.sync_status === 'accepted' ? 'Confirmada' : 'Em análise'}</td></tr>)}{!values.length && <Empty colSpan={6} />}</tbody></table></div></section>; }
+function Timesheet({ employee, punches, days, locations, companyId, token, selectedLocationId, from, to, onSaved }: { employee: Employee | undefined; punches: Punch[]; days: WorkDay[]; locations: Location[]; companyId: string; token: string; selectedLocationId: string; from: string; to: string; onSaved: () => void }) {
+  const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  const slotOrder = ['entry', 'break_start', 'break_end', 'exit'];
+  const dailyRows = useMemo(() => {
+    const dayByKey = new Map(days.map((day) => [day.local_date, day]));
+    const punchByDay = new Map<string, Punch[]>();
+    punches.forEach((punch) => { const key = fortalezaDate(punch.timestamp); punchByDay.set(key, [...(punchByDay.get(key) ?? []), punch]); });
+    const keys = new Set([...dayByKey.keys(), ...punchByDay.keys()]);
+    if (from && to) {
+      const cursor = new Date(`${from}T12:00:00Z`); const end = new Date(`${to}T12:00:00Z`);
+      while (cursor <= end) { keys.add(cursor.toISOString().slice(0, 10)); cursor.setUTCDate(cursor.getUTCDate() + 1); }
+    }
+    const classifications = new Map(days.flatMap((day) => currentCalculation(day)?.classifications ?? []).map((item) => [item.event_id, item.type]));
+    return [...keys].sort().map((date) => {
+      const slots: Record<string, Punch | undefined> = {}; const extras: Punch[] = [];
+      (punchByDay.get(date) ?? []).sort((left, right) => left.timestamp.localeCompare(right.timestamp)).forEach((punch, index) => {
+        const type = classifications.get(punch.id); const slot = type && slotOrder.includes(type) ? type : slotOrder[index];
+        if (slot && !slots[slot]) slots[slot] = punch; else extras.push(punch);
+      });
+      return { date, slots, extras, calculation: currentCalculation(dayByKey.get(date) ?? { attendance_calculations: [] } as WorkDay) };
+    });
+  }, [days, punches, from, to]);
+  const totals = dailyRows.reduce((result, row) => ({ worked: result.worked + (row.calculation?.worked_minutes ?? 0), overtime: result.overtime + (row.calculation?.gross_overtime_minutes ?? 0), balance: result.balance + (row.calculation?.net_balance_minutes ?? 0) }), { worked: 0, overtime: 0, balance: 0 });
+  async function editPunch(punch: Punch, date: string, label: string) {
+    if (punch.source === 'manual') { setMessage('Esta batida foi incluída manualmente. Para preservar a auditoria, registre a correção pelo formulário de correções.'); return; }
+    if (punch.sync_status !== 'accepted') { setMessage('Aguarde a confirmação da batida antes de corrigi-la.'); return; }
+    const time = window.prompt(`Novo horário para ${label} (${date})`, fortalezaTime(punch.timestamp));
+    if (!time || !/^\d{2}:\d{2}$/.test(time)) return;
+    const reason = window.prompt('Motivo da correção', 'Correção pela apuração do período');
+    if (!reason?.trim()) return;
+    setPending(true); setMessage('');
+    try { await api(`/v1/punches/${punch.id}/adjustments`, token, { method: 'POST', body: JSON.stringify({ company_id: companyId, corrected_timestamp: `${date}T${time}:00-03:00`, reason: reason.trim() }) }); setMessage('Horário corrigido e jornada enviada para recálculo.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível corrigir o horário.'); }
+    finally { setPending(false); }
+  }
+  async function addPunch(date: string, label: string) {
+    const time = window.prompt(`Horário de ${label} (${date})`, '08:00');
+    if (!time || !/^\d{2}:\d{2}$/.test(time)) return;
+    const reason = window.prompt('Motivo da inclusão', 'Batida esquecida informada na apuração do período');
+    if (!reason?.trim()) return;
+    const locationId = selectedLocationId || employee?.home_location_id || locations.find((item) => item.active)?.id;
+    if (!locationId) { setMessage('Cadastre ou selecione um local antes de incluir uma batida.'); return; }
+    setPending(true); setMessage('');
+    try { await api('/v1/manual-punches', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employee?.id, location_id: locationId, corrected_timestamp: `${date}T${time}:00-03:00`, reason: reason.trim() }) }); setMessage('Batida incluída e jornada enviada para recálculo.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível incluir a batida.'); }
+    finally { setPending(false); }
+  }
+  const cell = (row: typeof dailyRows[number], slot: string, label: string) => { const punch = row.slots[slot]; return <td className="timesheet-cell" title="Clique duas vezes para corrigir ou incluir" onDoubleClick={() => { if (!pending) void (punch ? editPunch(punch, row.date, label) : addPunch(row.date, label)); }}>{punch ? fortalezaTime(punch.timestamp) : '—'}</td>; };
+  return <section className="panel timesheet"><div className="timesheet-heading"><div><p className="eyebrow">APURAÇÃO DO PERÍODO</p><h2>{employee?.name ?? 'Funcionário'}</h2><p>{employee?.registration ? `Matrícula: ${employee.registration}` : 'Matrícula não informada'} · {from || 'Início não selecionado'} até {to || 'Fim não selecionado'}</p></div><small>Clique duas vezes em um horário para corrigir. Clique duas vezes em uma célula vazia para incluir uma batida esquecida.</small></div><div className="table-wrap"><table><thead><tr><th>Data</th><th>Entrada</th><th>Saída 1</th><th>Entrada 2</th><th>Saída 2</th><th>Outras</th><th>Trabalhado</th><th>Extra</th><th>Saldo</th></tr></thead><tbody>{dailyRows.map((row) => <tr key={row.date}><td>{dayLabel(row.date)}</td>{cell(row, 'entry', 'entrada')}{cell(row, 'break_start', 'saída para intervalo')}{cell(row, 'break_end', 'retorno do intervalo')}{cell(row, 'exit', 'saída')}<td>{row.extras.map((punch) => fortalezaTime(punch.timestamp)).join(' · ') || '—'}</td><td>{minutes(row.calculation?.worked_minutes)}</td><td>{minutes(row.calculation?.gross_overtime_minutes)}</td><td>{minutes(row.calculation?.net_balance_minutes)}</td></tr>)}{!dailyRows.length && <Empty colSpan={9} />}</tbody></table></div><div className="timesheet-totals"><strong>Horas trabalhadas: {minutes(totals.worked)}</strong><strong>Horas extras: {minutes(totals.overtime)}</strong><strong>Saldo: {minutes(totals.balance)}</strong></div>{message && <p className="form-message">{message}</p>}</section>;
+}
 function Adjustments({ values, employees }: { values: PunchAdjustment[]; employees: Employee[] }) { const name = (id: string) => employees.find((employee) => employee.id === id)?.name ?? 'Funcionário não localizado'; return <section className="panel adjustments"><h2>Correções recentes</h2><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Registrada</th><th>Novo horário</th><th>Motivo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{name(item.employee_id)}</td><td>{dateTime(item.created_at)}</td><td>{dateTime(item.corrected_timestamp)}</td><td>{item.reason}</td></tr>)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
 function Employees({ values, facialProfiles, companyId, token, onSaved }: { values: Employee[]; facialProfiles: FacialProfileStatus[]; companyId: string; token: string; onSaved: () => void }) { const prepared = new Map(facialProfiles.map((profile) => [profile.employee_id, profile])); return <section className="panel employees"><h2>Funcionários</h2><p>Funcionários desativados permanecem visíveis para que possam ser reativados sem perder o histórico.</p><div className="table-wrap"><table><thead><tr><th>Matrícula</th><th>Nome</th><th>Cargo</th><th>Situação</th><th>Reconhecimento facial</th><th></th></tr></thead><tbody>{values.map((item) => <EmployeeRow key={item.id} employee={item} facialProfile={prepared.get(item.id)} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <Empty colSpan={6} />}</tbody></table></div></section>; }
 function EmployeeRow({ employee, facialProfile, companyId, token, onSaved }: { employee: Employee; facialProfile: FacialProfileStatus | undefined; companyId: string; token: string; onSaved: () => void }) {

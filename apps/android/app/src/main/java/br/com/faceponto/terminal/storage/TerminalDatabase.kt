@@ -107,6 +107,9 @@ interface PunchDao {
     @Query("SELECT COUNT(*) FROM sync_outbox WHERE state = 'pending'")
     suspend fun pendingCount(): Int
 
+    @Query("SELECT p.* FROM punch_events p JOIN sync_outbox o ON o.eventId=p.id WHERE p.employeeId=:employeeId AND o.state!='rejected' ORDER BY p.deviceTimestamp DESC LIMIT 1")
+    suspend fun latestRecordedPunch(employeeId: String): PunchEventEntity?
+
     @Query("DELETE FROM employee_catalog")
     suspend fun clearCatalog()
 

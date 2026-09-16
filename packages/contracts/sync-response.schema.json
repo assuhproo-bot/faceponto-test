@@ -48,7 +48,7 @@
       "properties": {
         "id": { "$ref": "#/$defs/uuid" },
         "status": { "const": "rejected" },
-        "code": { "enum": ["IDEMPOTENCY_CONFLICT", "EMPLOYEE_NOT_AUTHORIZED", "INVALID_ASSIGNMENT", "INVALID_RECOGNITION_EVIDENCE", "INVALID_CLOCK_ANCHOR"] }
+        "code": { "enum": ["IDEMPOTENCY_CONFLICT", "EMPLOYEE_NOT_AUTHORIZED", "INVALID_ASSIGNMENT", "INVALID_RECOGNITION_EVIDENCE", "INVALID_CLOCK_ANCHOR", "PUNCH_ALREADY_REGISTERED"] }
       }
     },
     "retry": {

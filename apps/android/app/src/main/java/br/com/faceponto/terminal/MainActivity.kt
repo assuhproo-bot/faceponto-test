@@ -36,6 +36,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import br.com.faceponto.terminal.auth.*
 import br.com.faceponto.terminal.clock.BootIdentity
+import br.com.faceponto.terminal.clock.PunchCooldown
 import br.com.faceponto.terminal.storage.TerminalDatabase
 import br.com.faceponto.terminal.sync.TerminalSyncWorker
 import br.com.faceponto.terminal.recognition.OpenCvFaceEngine
@@ -220,7 +221,11 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
                     android.util.Log.i("FacePontoPad", "test_pad_passed; persisting")
                     runCatching { persistFacePunch(context, match.employeeId, decision) }.fold(
                         onSuccess = { android.util.Log.i("FacePontoPad", "punch_persisted"); "Ponto registrado com sucesso. Afaste o rosto para liberar a próxima marcação." to true },
-                        onFailure = { android.util.Log.e("FacePontoPad", "punch_persist_failed", it); "Não foi possível registrar: ${it.message ?: "dados incompletos"}" to false },
+                        onFailure = { failure ->
+                            android.util.Log.e("FacePontoPad", "punch_persist_failed", failure)
+                            if (failure.message?.startsWith("Ponto já registrado") == true) "Ponto já registrado. Aguarde cinco minutos." to false
+                            else "Não foi possível registrar: ${failure.message ?: "dados incompletos"}" to false
+                        },
                     )
                 }
                 is PadDecision.Failed -> "Presença recusada: ${decision.reason}" to false
@@ -249,6 +254,7 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
     val punchAccepted = captureMessage?.startsWith("Ponto registrado") == true
     val spokenConfirmation = when {
         captureMessage?.startsWith("Ponto registrado com sucesso") == true -> "${employeeName.ifBlank { "Funcionário" }}, ponto registrado com sucesso."
+        captureMessage?.startsWith("Ponto já registrado") == true -> "Ponto já registrado. Aguarde cinco minutos."
         captureMessage?.startsWith("Rosto saiu da câmera") == true || captureMessage?.startsWith("Tempo esgotado") == true || captureMessage?.startsWith("Presença recusada") == true || captureMessage?.startsWith("Não foi possível registrar") == true -> "Não foi possível verificar. Tente novamente."
         else -> null
     }
@@ -350,6 +356,11 @@ private suspend fun persistFacePunch(context: android.content.Context, employeeI
     val expiresAt = Instant.parse(anchor.expiresAt)
     val deviceTimestamp = Instant.parse(anchor.serverTimestamp).plusMillis(elapsed - anchor.deviceElapsedMs)
     require(deviceTimestamp.isBefore(expiresAt)) { "Relógio precisa ser verificado novamente" }
+    dao.latestRecordedPunch(employeeId)?.let { lastPunch ->
+        if (PunchCooldown.stillActive(Instant.parse(lastPunch.deviceTimestamp), deviceTimestamp)) {
+            throw IllegalStateException("Ponto já registrado. Aguarde cinco minutos.")
+        }
+    }
     dao.persistCapturedPunch(PunchEventEntity(
         id = UUID.randomUUID().toString(), employeeId = employee.id,
         terminalAssignmentId = terminal.terminalAssignmentId, deviceTimestamp = deviceTimestamp.toString(),
