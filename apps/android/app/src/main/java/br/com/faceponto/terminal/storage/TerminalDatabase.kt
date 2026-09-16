@@ -127,6 +127,9 @@ interface PunchDao {
     @Query("SELECT * FROM employee_catalog ORDER BY name LIMIT 1")
     suspend fun firstCatalogEmployee(): CatalogEmployeeEntity?
 
+    @Query("SELECT * FROM employee_catalog ORDER BY name")
+    suspend fun catalogEmployees(): List<CatalogEmployeeEntity>
+
     @Query("SELECT * FROM employee_catalog WHERE id=:employeeId LIMIT 1")
     suspend fun catalogEmployee(employeeId: String): CatalogEmployeeEntity?
 

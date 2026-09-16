@@ -51,6 +51,7 @@ import br.com.faceponto.terminal.capture.PadFrame
 import br.com.faceponto.terminal.capture.PresentationAttackDetectionProvider
 import br.com.faceponto.terminal.capture.defaultPadProvider
 import br.com.faceponto.terminal.storage.FacialProfileEntity
+import br.com.faceponto.terminal.storage.CatalogEmployeeEntity
 import br.com.faceponto.terminal.storage.PunchEventEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -115,8 +116,25 @@ class MainActivity : ComponentActivity() {
     var passivePadScore by remember { mutableStateOf<Float?>(null) }
     var enrollmentMessage by remember { mutableStateOf<String?>(null) }
     var profileRevision by remember { mutableIntStateOf(0) }
+    var selectedEnrollmentEmployeeId by remember { mutableStateOf("") }
+    var enrollmentMenuOpen by remember { mutableStateOf(false) }
     val candidates by produceState(initialValue = emptyList(), profileRevision) {
         value = withContext(Dispatchers.IO) { TerminalDatabase.open(context).punches().facialProfileCandidates() }
+    }
+    val catalogEmployees by produceState(initialValue = emptyList<CatalogEmployeeEntity>()) {
+        while (true) {
+            value = withContext(Dispatchers.IO) { TerminalDatabase.open(context).punches().catalogEmployees() }
+            delay(5_000)
+        }
+    }
+    val enrollmentCandidates = catalogEmployees.filter { employee ->
+        employee.serverProfileId != null && candidates.none { candidate -> candidate.employeeId == employee.id }
+    }
+    val selectedEnrollmentEmployee = enrollmentCandidates.firstOrNull { it.id == selectedEnrollmentEmployeeId }
+    LaunchedEffect(enrollmentCandidates, selectedEnrollmentEmployeeId) {
+        if (enrollmentCandidates.none { it.id == selectedEnrollmentEmployeeId }) {
+            selectedEnrollmentEmployeeId = enrollmentCandidates.firstOrNull()?.id.orEmpty()
+        }
     }
     var localMatch by remember { mutableStateOf<LocalMatch?>(null) }
     var movementChallenge by remember { mutableStateOf(MovementChallengeState.create()) }
@@ -228,24 +246,34 @@ class MainActivity : ComponentActivity() {
                 if (!punchAccepted && localMatch != null && movementChallenge.step != MovementStep.CENTER) Text("Siga a orientação sem sair da câmera.", fontSize = 14.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
             }
         }
-        if (BuildConfig.DEBUG && candidates.isEmpty()) Surface(color = Color(0xFFFFF4D6), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+        if (BuildConfig.DEBUG) Surface(color = Color(0xFFFFF4D6), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Configuração inicial", fontWeight = FontWeight.Bold, color = Color(0xFF6B4B00))
-                Text("Somente o responsável deve cadastrar a amostra do funcionário neste terminal.", fontSize = 13.sp, color = Color(0xFF6B4B00))
-                Button(onClick = {
-            val captured = embedding ?: return@Button
-            scope.launch {
-                enrollmentMessage = "Protegendo amostra..."
-                enrollmentMessage = withContext(Dispatchers.IO) {
-                    val dao = TerminalDatabase.open(context).punches()
-                    val employee = dao.firstCatalogEmployee() ?: return@withContext "Catálogo sem funcionário"
-                    val encrypted = BiometricCipher().encrypt(employee.id, OpenCvFaceEngine.RECOGNITION_SHA256, captured)
-                    dao.saveFacialProfile(FacialProfileEntity(employee.id, encrypted, OpenCvFaceEngine.RECOGNITION_SHA256, 1, System.currentTimeMillis()))
-                    "Amostra cifrada para ${employee.name}"
+                Text("Cadastro facial — responsável", fontWeight = FontWeight.Bold, color = Color(0xFF6B4B00))
+                Text("Selecione a pessoa preparada no painel e peça para ela olhar para a câmera.", fontSize = 13.sp, color = Color(0xFF6B4B00))
+                if (enrollmentCandidates.isNotEmpty()) {
+                    Box {
+                        OutlinedButton(onClick = { enrollmentMenuOpen = true }) { Text(selectedEnrollmentEmployee?.name ?: "Selecione o funcionário") }
+                        DropdownMenu(expanded = enrollmentMenuOpen, onDismissRequest = { enrollmentMenuOpen = false }) {
+                            enrollmentCandidates.forEach { employee -> DropdownMenuItem(text = { Text(employee.name) }, onClick = { selectedEnrollmentEmployeeId = employee.id; enrollmentMenuOpen = false }) }
+                        }
+                    }
+                    Button(onClick = {
+                        val captured = embedding ?: return@Button
+                        val employee = selectedEnrollmentEmployee ?: return@Button
+                        scope.launch {
+                            enrollmentMessage = "Protegendo amostra..."
+                            enrollmentMessage = withContext(Dispatchers.IO) {
+                                val dao = TerminalDatabase.open(context).punches()
+                                val encrypted = BiometricCipher().encrypt(employee.id, OpenCvFaceEngine.RECOGNITION_SHA256, captured)
+                                dao.saveFacialProfile(FacialProfileEntity(employee.id, encrypted, OpenCvFaceEngine.RECOGNITION_SHA256, 1, System.currentTimeMillis()))
+                                "Amostra cifrada para ${employee.name}"
+                            }
+                            profileRevision++
+                        }
+                    }, enabled = embedding != null && selectedEnrollmentEmployee != null) { Text("Cadastrar amostra") }
+                } else {
+                    Text("Nenhum perfil facial pendente. No painel, prepare primeiro o funcionário que será cadastrado.", fontSize = 13.sp, color = Color(0xFF6B4B00))
                 }
-                profileRevision++
-            }
-                }, enabled = embedding != null) { Text("Cadastrar amostra") }
                 enrollmentMessage?.let { Text(it, fontSize = 12.sp, color = Color(0xFF6B4B00)) }
             }
         }
