@@ -10,6 +10,10 @@ export type Punch = {
   source: string; reason?: string; location_name: string | null; employee_name: string | null; employee_registration: string | null;
 };
 export type FacialProfileStatus = { employee_id: string; profile_version: number; prepared_at: string };
+export type CompanyPaymentSettings = {
+  id: string; company_id: string; regular_hour_cents: number; overtime_hour_cents: number; meal_cents: number;
+  dinner_cents: number; daily_allowance_cents: number; night_shift_cents: number; saturday_cents: number; version: number;
+};
 export type EmployeePaymentSettings = {
   id: string; company_id: string; employee_id: string; regular_hour_cents: number; overtime_hour_cents: number;
   meal_cents: number; dinner_cents: number; daily_allowance_cents: number; night_shift_cents: number; saturday_cents: number; version: number;

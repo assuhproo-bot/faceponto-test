@@ -114,6 +114,13 @@ const employeeSchedulePlanBody = z.object({
 const employeeSchedulePlanParams = z.object({ id: z.uuid() }).strict();
 const clearEmployeeSchedulePlanBody = z.object({ company_id: z.uuid(), expected_version: z.number().int().positive() }).strict();
 const facialProfileBody = z.object({ company_id: z.uuid(), employee_id: z.uuid() }).strict();
+const companyPaymentSettingsBody = z.object({
+  company_id: z.uuid(), expected_version: z.number().int().positive().nullable().optional(),
+  regular_hour_cents: z.number().int().min(0).max(10000000), overtime_hour_cents: z.number().int().min(0).max(10000000),
+  meal_cents: z.number().int().min(0).max(10000000), dinner_cents: z.number().int().min(0).max(10000000),
+  daily_allowance_cents: z.number().int().min(0).max(10000000), night_shift_cents: z.number().int().min(0).max(10000000),
+  saturday_cents: z.number().int().min(0).max(10000000),
+}).strict();
 const paymentSettingsQuery = z.object({ company_id: z.uuid(), employee_id: z.uuid() }).strict();
 const paymentSettingsBody = z.object({
   company_id: z.uuid(), employee_id: z.uuid(), expected_version: z.number().int().positive().nullable().optional(),
@@ -298,6 +305,24 @@ export function buildApp(config: ApiConfig) {
     const { data, error: dbError } = await request.auth!.db.rpc('list_facial_profile_status', { p_company: query.company_id });
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return { data };
+  });
+  app.get('/v1/company-payment-settings', async (request, reply) => {
+    const query = tenantQuery.parse(request.query);
+    const { data, error: dbError } = await request.auth!.db.from('company_payment_settings')
+      .select('id,company_id,regular_hour_cents,overtime_hour_cents,meal_cents,dinner_cents,daily_allowance_cents,night_shift_cents,saturday_cents,version')
+      .eq('company_id', query.company_id).maybeSingle();
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
+  app.post('/v1/company-payment-settings', async (request, reply) => {
+    const body = companyPaymentSettingsBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('save_company_payment_settings', {
+      p_company: body.company_id, p_regular_hour_cents: body.regular_hour_cents, p_overtime_hour_cents: body.overtime_hour_cents,
+      p_meal_cents: body.meal_cents, p_dinner_cents: body.dinner_cents, p_daily_allowance_cents: body.daily_allowance_cents,
+      p_night_shift_cents: body.night_shift_cents, p_saturday_cents: body.saturday_cents, p_expected_version: body.expected_version ?? null,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
   });
   app.get('/v1/payment-settings', async (request, reply) => {
     const query = paymentSettingsQuery.parse(request.query);
