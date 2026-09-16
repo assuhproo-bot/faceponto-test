@@ -17,8 +17,8 @@ android {
         applicationId = "br.com.faceponto.terminal$applicationSuffix"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
         // The local test terminal is arm64. Avoid bundling emulator and 32-bit native libraries.
         ndk { abiFilters += "arm64-v8a" }
         buildConfigField("String", "API_BASE_URL", "\"$apiBaseUrl\"")
