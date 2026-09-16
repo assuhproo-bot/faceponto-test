@@ -61,14 +61,14 @@ export function startAttendanceWorker(config: ApiConfig) {
   });
   let stopped = false; let running = false;
 
-  const processOne = async () => {
-    if (stopped || running) return; running = true;
+  const processOne = async (): Promise<boolean> => {
+    if (stopped || running) return false; running = true;
     let job: Job | null = null;
     try {
       const claimed = await admin.rpc('claim_attendance_recalculation', { p_lease_seconds: 120 });
       if (claimed.error) throw claimed.error;
       job = claimed.data as Job | null;
-      if (!job) return;
+      if (!job) return false;
       const company = await admin.from('companies').select('timezone').eq('id', job.company_id).single();
       if (company.error) throw company.error;
       const timeZone = company.data.timezone as string;
@@ -135,7 +135,7 @@ export function startAttendanceWorker(config: ApiConfig) {
         if (eligible[1]?.distance === eligible[0]?.distance) eligible.filter((item) => item.distance === eligible[0]?.distance).forEach((item) => item.candidate.ambiguous.push(punch.id));
         else eligible[0]!.candidate.punches.push(punch);
       }
-      for (const candidate of candidates) {
+      const recordCandidate = async (candidate: Candidate) => {
         const version = candidate.schedule;
         const engineInput = { journey_start: new Date(candidate.originMs).toISOString(), evaluated_at: new Date().toISOString(),
           schedule_version: version.version, rules_version: version.version, rules: version.rules,
@@ -144,16 +144,21 @@ export function startAttendanceWorker(config: ApiConfig) {
         for (const eventId of candidate.ambiguous) result.occurrences.push({ code: 'AMBIGUOUS_JOURNEY', severity: 'error', definitive: true, event_id: eventId });
         const inputHash = createHash('sha256').update(JSON.stringify(engineInput)).digest('hex');
         const recorded = await admin.rpc('record_attendance_calculation', {
-          p_company: job.company_id, p_employee: job.employee_id, p_schedule_version: version.id,
+          p_company: job!.company_id, p_employee: job!.employee_id, p_schedule_version: version.id,
           p_journey_start: new Date(candidate.originMs).toISOString(), p_journey_end: new Date(candidate.endMs).toISOString(),
           p_local_date: candidate.localDate, p_timezone: version.timezone, p_result: result, p_input_sha256: inputHash,
         });
         if (recorded.error) throw recorded.error;
+      };
+      // Work days are independent. Small batches reduce network round trips without overloading the database.
+      for (let index = 0; index < candidates.length; index += 6) {
+        await Promise.all(candidates.slice(index, index + 6).map(recordCandidate));
       }
       const completed = await admin.rpc('complete_attendance_recalculation', {
         p_company: job.company_id, p_employee: job.employee_id, p_lease_token: job.lease_token, p_requested_at: job.requested_at,
       });
       if (completed.error) throw completed.error;
+      return true;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message
         : cause && typeof cause === 'object' && 'message' in cause && typeof cause.message === 'string'
@@ -163,8 +168,17 @@ export function startAttendanceWorker(config: ApiConfig) {
         p_company: job.company_id, p_employee: job.employee_id, p_lease_token: job.lease_token,
         p_error: message,
       });
+      return false;
     } finally { running = false; }
   };
-  const timer = setInterval(() => void processOne(), 5_000); timer.unref(); void processOne();
-  return () => { stopped = true; clearInterval(timer); };
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  const run = async () => {
+    while (!stopped) {
+      const processed = await processOne();
+      // A short pause avoids a busy loop only when the queue is empty or a retry is needed.
+      if (!processed) await new Promise<void>((resolve) => { retryTimer = setTimeout(resolve, 750); });
+    }
+  };
+  void run();
+  return () => { stopped = true; if (retryTimer) clearTimeout(retryTimer); };
 }
