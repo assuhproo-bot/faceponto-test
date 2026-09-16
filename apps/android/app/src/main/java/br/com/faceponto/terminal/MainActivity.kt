@@ -1,6 +1,8 @@
 package br.com.faceponto.terminal
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.graphics.Matrix
@@ -166,6 +168,22 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
         defaultPadProvider(BuildConfig.DEBUG)
     }
     val scope = rememberCoroutineScope()
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(receiverContext: android.content.Context, intent: android.content.Intent) {
+                if (intent.action == TerminalSyncWorker.ACTION_PUNCH_REJECTED &&
+                    intent.getStringExtra(TerminalSyncWorker.EXTRA_RESULT_CODE) == TerminalSyncWorker.PUNCH_ALREADY_REGISTERED) {
+                    requireFaceExit = false
+                    movementChallenge = MovementChallengeState.create()
+                    challengeMatch = null
+                    padFrames = emptyList()
+                    captureMessage = "Ponto já registrado. Aguarde cinco minutos."
+                }
+            }
+        }
+        ContextCompat.registerReceiver(context, receiver, IntentFilter(TerminalSyncWorker.ACTION_PUNCH_REJECTED), ContextCompat.RECEIVER_NOT_EXPORTED)
+        onDispose { context.unregisterReceiver(receiver) }
+    }
     LaunchedEffect(embedding, candidates) {
         localMatch = embedding?.let { probe -> withContext(Dispatchers.IO) { runCatching { LocalFaceMatcher().identify(probe, candidates) }.getOrNull() } }
     }

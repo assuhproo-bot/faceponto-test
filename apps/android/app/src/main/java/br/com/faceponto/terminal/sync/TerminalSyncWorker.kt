@@ -1,6 +1,7 @@
 package br.com.faceponto.terminal.sync
 
 import android.content.Context
+import android.content.Intent
 import android.util.Log
 import androidx.work.*
 import br.com.faceponto.terminal.auth.CredentialStore
@@ -48,7 +49,15 @@ class TerminalSyncWorker(context: Context, params: WorkerParameters) : Coroutine
                     when (getString("status")) {
                         "accepted", "already_received" -> dao.finishSync(getString("id"), "synced", optString("receipt_id").ifBlank { null }, null)
                         "quarantined" -> dao.finishSync(getString("id"), "quarantined", optString("receipt_id").ifBlank { null }, optString("code"))
-                        "rejected" -> dao.finishSync(getString("id"), "rejected", null, optString("code"))
+                        "rejected" -> {
+                            val code = optString("code")
+                            dao.finishSync(getString("id"), "rejected", null, code)
+                            if (code == PUNCH_ALREADY_REGISTERED) {
+                                applicationContext.sendBroadcast(Intent(ACTION_PUNCH_REJECTED)
+                                    .setPackage(applicationContext.packageName)
+                                    .putExtra(EXTRA_RESULT_CODE, code))
+                            }
+                        }
                         "retry" -> dao.retryLater(getString("id"), now + getLong("retry_after_seconds") * 1000)
                     }
                 }
@@ -62,6 +71,9 @@ class TerminalSyncWorker(context: Context, params: WorkerParameters) : Coroutine
     }
 
     companion object {
+        const val ACTION_PUNCH_REJECTED = "br.com.faceponto.terminal.PUNCH_REJECTED"
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val PUNCH_ALREADY_REGISTERED = "PUNCH_ALREADY_REGISTERED"
         private val network = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
         fun refreshNow(context: Context) {
             WorkManager.getInstance(context).enqueueUniqueWork("terminal-sync-now", ExistingWorkPolicy.REPLACE,
