@@ -160,7 +160,7 @@ function mapDatabaseError(reply: FastifyReply, request: FastifyRequest, dbError:
   return error(reply, 500, 'INTERNAL_ERROR', 'Não foi possível concluir a operação.', request.id);
 }
 
-type ReportCalculation = { state: string; planned_minutes: number; worked_minutes: number | null; net_balance_minutes: number | null };
+type ReportCalculation = { state: string; planned_minutes: number; worked_minutes: number | null; gross_overtime_minutes: number | null; net_balance_minutes: number | null };
 type ReportWorkDay = { employee_id: string; local_date: string; attendance_calculations: ReportCalculation[] };
 type ReportEmployee = { id: string; name: string; registration: string };
 
@@ -174,7 +174,7 @@ function toAttendanceReport(
     return {
       date: day.local_date, employee: employee?.name ?? day.employee_id, registration: employee?.registration ?? '-',
       plannedMinutes: calculation?.planned_minutes ?? 0, workedMinutes: calculation?.worked_minutes ?? null,
-      balanceMinutes: calculation?.net_balance_minutes ?? null, state: calculation?.state ?? 'sem calculo',
+      balanceMinutes: calculation?.net_balance_minutes ?? null, overtimeMinutes: calculation?.gross_overtime_minutes ?? null, missingMinutes: calculation?.net_balance_minutes != null ? Math.max(0, -calculation.net_balance_minutes) : null, state: calculation?.state ?? 'sem calculo',
     };
   }).sort((left, right) => left.date.localeCompare(right.date) || left.employee.localeCompare(right.employee));
   return { companyName: company.name, timezone: company.timezone, generatedAt: new Date(), from: query.date_from, to: query.date_to, rows };
@@ -603,7 +603,7 @@ export function buildApp(config: ApiConfig) {
   app.get('/v1/reports/attendance', async (request, reply) => {
     const query = attendanceReportQuery.parse(request.query);
     let daysRequest = request.auth!.db.from('work_days')
-      .select('employee_id,local_date,attendance_calculations(state,planned_minutes,worked_minutes,net_balance_minutes)')
+      .select('employee_id,local_date,attendance_calculations(state,planned_minutes,worked_minutes,gross_overtime_minutes,net_balance_minutes)')
       .eq('company_id', query.company_id).order('local_date', { ascending: true }).limit(5_000);
     if (query.employee_id) daysRequest = daysRequest.eq('employee_id', query.employee_id);
     if (query.date_from) daysRequest = daysRequest.gte('local_date', query.date_from);
