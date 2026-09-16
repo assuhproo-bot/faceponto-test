@@ -7,6 +7,7 @@ import android.graphics.Matrix
 import android.graphics.Bitmap
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -61,6 +62,7 @@ import java.util.concurrent.Executors
 import java.time.Instant
 import java.util.UUID
 import java.util.Calendar
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,6 +77,17 @@ class MainActivity : ComponentActivity() {
         }
         setContent { FacePontoApp() }
     }
+}
+
+private class FacePontoVoice(context: android.content.Context) : TextToSpeech.OnInitListener {
+    private var ready = false
+    private val speaker = TextToSpeech(context.applicationContext, this)
+    override fun onInit(status: Int) {
+        ready = status == TextToSpeech.SUCCESS
+        if (ready) speaker.language = Locale("pt", "BR")
+    }
+    fun say(text: String) { if (ready) speaker.speak(text, TextToSpeech.QUEUE_FLUSH, null, "faceponto-confirmation") }
+    fun close() { speaker.stop(); speaker.shutdown() }
 }
 
 @Composable private fun FacePontoApp() {
@@ -98,6 +111,8 @@ class MainActivity : ComponentActivity() {
 
 @Composable private fun TerminalScreen(credentials: TerminalCredentials) {
     val context = LocalContext.current; var granted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    val voice = remember { FacePontoVoice(context) }
+    DisposableEffect(Unit) { onDispose { voice.close() } }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
     val pending by produceState<Int?>(null) { value = withContext(Dispatchers.IO) { TerminalDatabase.open(context).punches().pendingCount() } }
     val catalogCount by produceState<Int?>(null) { delay(6_000); value = withContext(Dispatchers.IO) { TerminalDatabase.open(context).punches().catalogCount() } }
@@ -213,6 +228,12 @@ class MainActivity : ComponentActivity() {
     }
     val employeeName = localMatch?.employeeName?.trim()?.substringBefore(' ') ?: ""
     val punchAccepted = captureMessage?.startsWith("Ponto registrado") == true
+    val spokenConfirmation = when {
+        captureMessage?.startsWith("Ponto registrado com sucesso") == true -> "${employeeName.ifBlank { "Funcionário" }}, ponto registrado com sucesso."
+        captureMessage?.startsWith("Rosto saiu da câmera") == true || captureMessage?.startsWith("Presença recusada") == true || captureMessage?.startsWith("Não foi possível registrar") == true -> "Não foi possível verificar. Tente novamente."
+        else -> null
+    }
+    LaunchedEffect(spokenConfirmation) { spokenConfirmation?.let(voice::say) }
     LaunchedEffect(punchAccepted) {
         if (punchAccepted) {
             val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
@@ -239,9 +260,9 @@ class MainActivity : ComponentActivity() {
     Column(Modifier.fillMaxSize().background(Color(0xFFF3F7F4)).padding(horizontal = 20.dp, vertical = 28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("FACEPONTO", fontSize = 14.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp, color = Color(0xFF2B6B55))
         Text(title, fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color(0xFF12372A), textAlign = TextAlign.Center)
-        Text(if (punchAccepted) "Ponto registrado com sucesso." else "Olhe para a câmera para registrar sua jornada.", fontSize = 16.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
+        if (!punchAccepted) Text("Olhe para a câmera para registrar sua jornada.", fontSize = 16.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
         Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black, RoundedCornerShape(28.dp)), contentAlignment = Alignment.Center) { if (granted) CameraPreview(engine, { observation = it.observation; embedding = it.embedding; passivePadScore = it.passivePadScore }, Modifier.fillMaxSize()) else Text("Permita o uso da câmera", color = Color.White) }
-        Surface(color = if (punchAccepted) Color(0xFFD9F7E5) else Color.White, shape = RoundedCornerShape(18.dp), tonalElevation = 1.dp, modifier = Modifier.fillMaxWidth()) {
+        if (!punchAccepted) Surface(color = Color.White, shape = RoundedCornerShape(18.dp), tonalElevation = 1.dp, modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(status, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF12372A), textAlign = TextAlign.Center)
                 if (!punchAccepted && localMatch != null && movementChallenge.step != MovementStep.CENTER) Text("Siga a orientação sem sair da câmera.", fontSize = 14.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)

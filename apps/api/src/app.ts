@@ -57,10 +57,17 @@ const pairingBody = z.object({ code: z.string().min(32).max(64) }).strict();
 const refreshBody = z.object({ refresh_token: z.string().min(1).max(4096) }).strict();
 const heartbeatBody = z.object({ pending_count: z.number().int().min(0).max(100000), app_version: z.string().trim().min(1).max(40) }).strict();
 const clockAnchorBody = z.object({ boot_id: z.uuid(), device_elapsed_ms: z.number().int().min(0), uncertainty_ms: z.number().int().min(0).max(60000) }).strict();
-const punchesQuery = z.object({ company_id: z.uuid(), employee_id: z.uuid().optional(), location_id: z.uuid().optional() }).strict();
+const punchesQuery = z.object({
+  company_id: z.uuid(), employee_id: z.uuid().optional(), location_id: z.uuid().optional(),
+  punch_from: z.iso.datetime({ offset: true }).optional(), punch_to: z.iso.datetime({ offset: true }).optional(),
+}).strict().refine((value) => !value.punch_from || !value.punch_to || new Date(value.punch_to) > new Date(value.punch_from));
 const punchParams = z.object({ id: z.uuid() }).strict();
 const punchAdjustmentBody = z.object({
   company_id: z.uuid(), corrected_timestamp: z.iso.datetime({ offset: true }), reason: z.string().trim().min(1).max(500),
+}).strict();
+const manualPunchBody = z.object({
+  company_id: z.uuid(), employee_id: z.uuid(), location_id: z.uuid(), corrected_timestamp: z.iso.datetime({ offset: true }),
+  reason: z.string().trim().min(1).max(500),
 }).strict();
 const punchAdjustmentsQuery = z.object({ company_id: z.uuid(), employee_id: z.uuid().optional() }).strict();
 const attendanceQuery = z.object({
@@ -448,18 +455,42 @@ export function buildApp(config: ApiConfig) {
       .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
     if (query.location_id) builder = builder.eq('location_id', query.location_id);
+    if (query.punch_from) builder = builder.gte('timestamp', query.punch_from);
+    if (query.punch_to) builder = builder.lt('timestamp', query.punch_to);
     const { data, error: dbError } = await builder;
     if (dbError) return mapDatabaseError(reply, request, dbError);
+    let manualBuilder = request.auth!.db.from('manual_punches').select('id,employee_id,company_id,location_id,timestamp,reason,created_at,employees(name,registration)')
+      .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
+    if (query.employee_id) manualBuilder = manualBuilder.eq('employee_id', query.employee_id);
+    if (query.location_id) manualBuilder = manualBuilder.eq('location_id', query.location_id);
+    if (query.punch_from) manualBuilder = manualBuilder.gte('timestamp', query.punch_from);
+    if (query.punch_to) manualBuilder = manualBuilder.lt('timestamp', query.punch_to);
+    const { data: manualData, error: manualError } = await manualBuilder;
+    if (manualError) return mapDatabaseError(reply, request, manualError);
     const namedPunches = (data ?? []).map(({ employees, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }> } & Record<string, unknown>) => {
       const employee = Array.isArray(employees) ? employees[0] : employees;
       return { ...punch, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
     });
-    return { data: namedPunches };
+    const namedManualPunches = (manualData ?? []).map(({ employees, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }> } & Record<string, unknown>) => {
+      const employee = Array.isArray(employees) ? employees[0] : employees;
+      return { ...punch, source: 'manual', punch_type: 'unclassified', sync_status: 'accepted', clock_status: 'verified', employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
+    });
+    const allPunches = [...namedPunches, ...namedManualPunches] as unknown as Array<Record<string, unknown> & { timestamp: string }>;
+    return { data: allPunches.sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, 200) };
   });
   app.post('/v1/punches/:id/adjustments', async (request, reply) => {
     const params = punchParams.parse(request.params); const body = punchAdjustmentBody.parse(request.body);
     const { data, error: dbError } = await request.auth!.db.rpc('create_punch_adjustment', {
       p_company: body.company_id, p_time_punch: params.id, p_corrected_timestamp: body.corrected_timestamp, p_reason: body.reason,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
+  });
+  app.post('/v1/manual-punches', async (request, reply) => {
+    const body = manualPunchBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('create_manual_punch', {
+      p_company: body.company_id, p_employee: body.employee_id, p_location: body.location_id,
+      p_timestamp: body.corrected_timestamp, p_reason: body.reason,
     });
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return reply.code(201).send(data);

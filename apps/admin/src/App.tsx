@@ -21,6 +21,9 @@ function minutes(value: number | null | undefined) {
   return `${sign}${Math.floor(absolute / 60)}h${String(absolute % 60).padStart(2, '0')}`;
 }
 function dateTime(value: string) { return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)); }
+function inputDate(value: Date) { return value.toISOString().slice(0, 10); }
+function localDayStart(value: string) { return new Date(`${value}T00:00:00`).toISOString(); }
+function localDayAfter(value: string) { const date = new Date(`${value}T00:00:00`); date.setDate(date.getDate() + 1); return date.toISOString(); }
 function currentCalculation(day: WorkDay) { return day.attendance_calculations.find((item) => item.state !== 'superseded') ?? day.attendance_calculations[0]; }
 
 export function App() {
@@ -104,6 +107,7 @@ function Access() {
 function Dashboard({ session, onLogout }: { session: Session; onLogout: () => void }) {
   const [me, setMe] = useState<Me | null>(null); const [companyId, setCompanyId] = useState('');
   const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [data, setData] = useState<DashboardData | null>(null);
+  const [employeeId, setEmployeeId] = useState(''); const [locationId, setLocationId] = useState('');
   const [error, setError] = useState(''); const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0);
   const [registrationDraft, setRegistrationDraft] = useState<EmployeeRegistrationRequest | null>(null);
   const [accountRefresh, setAccountRefresh] = useState(0); const [bootstrapAttempted, setBootstrapAttempted] = useState(false);
@@ -138,11 +142,11 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
     let active = true; setLoading(true); setError('');
     const query = { company_id: companyId, date_from: from || undefined, date_to: to || undefined };
     void Promise.all([
-      api<{ data: WorkDay[] }>(withQuery('/v1/attendance', query), session.access_token),
-      api<{ data: Occurrence[] }>(withQuery('/v1/occurrences', { company_id: companyId }), session.access_token),
-      api<{ data: BankEntry[]; balance_minutes: number }>(withQuery('/v1/bank-hours', query), session.access_token),
-      api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId }), session.access_token),
-      api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId }), session.access_token),
+      api<{ data: WorkDay[] }>(withQuery('/v1/attendance', { ...query, employee_id: employeeId || undefined }), session.access_token),
+      api<{ data: Occurrence[] }>(withQuery('/v1/occurrences', { company_id: companyId, employee_id: employeeId || undefined }), session.access_token),
+      api<{ data: BankEntry[]; balance_minutes: number }>(withQuery('/v1/bank-hours', { ...query, employee_id: employeeId || undefined }), session.access_token),
+      api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId, employee_id: employeeId || undefined, location_id: locationId || undefined, punch_from: from ? localDayStart(from) : undefined, punch_to: to ? localDayAfter(to) : undefined }), session.access_token),
+      api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId, employee_id: employeeId || undefined }), session.access_token),
       api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
       api<{ data: FacialProfileStatus[] }>(withQuery('/v1/facial-profiles', { company_id: companyId }), session.access_token),
       api<{ data: EmployeeLocation[] }>(withQuery('/v1/employee-locations', { company_id: companyId }), session.access_token),
@@ -157,16 +161,25 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
     }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar os dados.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [session.access_token, companyId, from, to, refresh]);
+  }, [session.access_token, companyId, employeeId, locationId, from, to, refresh]);
   const selectedCompany = useMemo(() => me?.memberships.find((item) => item.company_id === companyId)?.companies, [companyId, me]);
   const openOccurrences = data?.occurrences.filter((item) => item.status === 'open').length ?? 0;
+  function setPeriod(period: 'today' | 'week' | 'month' | 'all') {
+    if (period === 'all') { setFrom(''); setTo(''); return; }
+    const now = new Date(); const start = new Date(now);
+    if (period === 'week') start.setDate(now.getDate() - ((now.getDay() + 6) % 7));
+    if (period === 'month') start.setDate(1);
+    setFrom(inputDate(start)); setTo(inputDate(now));
+  }
   if (loading && !data) return <main className="centered">Carregando painel…</main>;
   return <main className="shell"><header><div><p className="eyebrow">FACEPONTO</p><h1>{selectedCompany?.name ?? 'Painel administrativo'}</h1></div>
     <div className="header-actions"><button className="secondary" onClick={() => setRefresh((value) => value + 1)}>Atualizar</button><button className="secondary" onClick={onLogout}>Sair</button></div></header>
     {error && <p className="notice error">{error}</p>}
     {!me?.memberships.length ? <p className="notice">Esta conta ainda não possui uma empresa. Crie uma conta nova para iniciar uma empresa local.</p> : <>
-      <section className="filters" aria-label="Filtros"><label>Empresa<select value={companyId} onChange={(event) => setCompanyId(event.target.value)}>{me.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label>
-        <label>De<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>Até<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label></section>
+      <section className="filters" aria-label="Filtros"><label>Empresa<select value={companyId} onChange={(event) => { setCompanyId(event.target.value); setEmployeeId(''); setLocationId(''); }}>{me.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label>
+        <label>Funcionário<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Todos</option>{(data?.employees ?? []).filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label>Local<select value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Todos</option>{(data?.locations ?? []).filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label>De<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>Até<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label><div className="report-actions"><button type="button" className="secondary" onClick={() => setPeriod('today')}>Hoje</button><button type="button" className="secondary" onClick={() => setPeriod('week')}>Esta semana</button><button type="button" className="secondary" onClick={() => setPeriod('month')}>Este mês</button><button type="button" className="secondary" onClick={() => setPeriod('all')}>Limpar período</button></div></section>
       <SetupGuide companyId={companyId} locations={data?.locations ?? []} employees={data?.employees ?? []} terminals={data?.terminals ?? []} schedules={data?.schedules ?? []} />
       <ReportDownloads companyId={companyId} from={from} to={to} token={session.access_token} />
       <section className="metrics"><Metric label="Jornadas" value={String(data?.days.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label="Saldo no período" value={minutes(data?.balance)} /></section>
@@ -181,7 +194,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       <ScheduleAssignment companyId={companyId} employees={data?.employees ?? []} schedules={data?.schedules ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <DailySchedulePlans values={data?.dailyPlans ?? []} employees={data?.employees ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <ScheduleAssignments values={data?.scheduleAssignments ?? []} employees={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
-      <AdjustmentForm companyId={companyId} punches={data?.punches ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <section className="grid employees-grid"><ManualPunchForm companyId={companyId} employees={data?.employees ?? []} locations={data?.locations ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><AdjustmentForm companyId={companyId} punches={data?.punches ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
       <Adjustments values={data?.adjustments ?? []} employees={data?.employees ?? []} />
     </>}
   </main>;
@@ -231,7 +244,7 @@ function OccurrenceRow({ occurrence, companyId, token, onSaved }: { occurrence: 
 function Bank({ values }: { values: BankEntry[] }) { return <section className="panel"><h2>Banco de horas</h2><div className="table-wrap"><table><thead><tr><th>Quando</th><th>Motivo</th><th>Saldo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{dateTime(item.created_at)}</td><td>{item.reason}</td><td>{minutes(item.delta_minutes)}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div></section>; }
 function Empty({ colSpan }: { colSpan: number }) { return <tr><td colSpan={colSpan} className="empty">Nenhum registro para este filtro.</td></tr>; }
 function punchKind(value: string) { return ({ entry: 'Entrada', break_start: 'Início do intervalo', break_end: 'Fim do intervalo', exit: 'Saída', unclassified: 'Registrada' } as Record<string, string>)[value] ?? 'Registrada'; }
-function RecentPunches({ values }: { values: Punch[] }) { return <section className="panel recent-punches"><h2>Últimas batidas</h2><p>Atualiza automaticamente a cada 20 segundos enquanto este painel estiver aberto.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Matrícula</th><th>Quando</th><th>Tipo</th><th>Status</th></tr></thead><tbody>{values.slice(0, 12).map((item) => <tr key={item.id}><td>{item.employee_name ?? 'Funcionário não localizado'}</td><td>{item.employee_registration ?? '—'}</td><td>{dateTime(item.timestamp)}</td><td>{punchKind(item.punch_type)}</td><td>{item.sync_status === 'accepted' ? 'Confirmada' : 'Em análise'}</td></tr>)}{!values.length && <Empty colSpan={5} />}</tbody></table></div></section>; }
+function RecentPunches({ values }: { values: Punch[] }) { return <section className="panel recent-punches"><h2>Registros de ponto</h2><p>Mostra o funcionário, local e período selecionados acima. Atualiza automaticamente a cada 20 segundos.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Matrícula</th><th>Quando</th><th>Tipo</th><th>Origem</th><th>Status</th></tr></thead><tbody>{values.slice(0, 200).map((item) => <tr key={item.id}><td>{item.employee_name ?? 'Funcionário não localizado'}</td><td>{item.employee_registration ?? '—'}</td><td>{dateTime(item.timestamp)}</td><td>{punchKind(item.punch_type)}</td><td>{item.source === 'manual' ? 'Inclusa pelo responsável' : 'Reconhecimento facial'}</td><td>{item.sync_status === 'accepted' ? 'Confirmada' : 'Em análise'}</td></tr>)}{!values.length && <Empty colSpan={6} />}</tbody></table></div></section>; }
 function Adjustments({ values, employees }: { values: PunchAdjustment[]; employees: Employee[] }) { const name = (id: string) => employees.find((employee) => employee.id === id)?.name ?? 'Funcionário não localizado'; return <section className="panel adjustments"><h2>Correções recentes</h2><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Registrada</th><th>Novo horário</th><th>Motivo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{name(item.employee_id)}</td><td>{dateTime(item.created_at)}</td><td>{dateTime(item.corrected_timestamp)}</td><td>{item.reason}</td></tr>)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
 function Employees({ values, facialProfiles, companyId, token, onSaved }: { values: Employee[]; facialProfiles: FacialProfileStatus[]; companyId: string; token: string; onSaved: () => void }) { const prepared = new Map(facialProfiles.map((profile) => [profile.employee_id, profile])); const active = values.filter((item) => item.active); return <section className="panel employees"><h2>Funcionários ativos</h2><div className="table-wrap"><table><thead><tr><th>Matrícula</th><th>Nome</th><th>Cargo</th><th>Reconhecimento facial</th><th></th></tr></thead><tbody>{active.slice(0, 12).map((item) => <EmployeeRow key={item.id} employee={item} facialProfile={prepared.get(item.id)} companyId={companyId} token={token} onSaved={onSaved} />)}{!active.length && <Empty colSpan={5} />}</tbody></table></div></section>; }
 function EmployeeRow({ employee, facialProfile, companyId, token, onSaved }: { employee: Employee; facialProfile: FacialProfileStatus | undefined; companyId: string; token: string; onSaved: () => void }) {
@@ -456,4 +469,20 @@ function AdjustmentForm({ companyId, punches, token, onSaved }: { companyId: str
       <label>Novo horário<input required type="datetime-local" value={timestamp} onChange={(event) => setTimestamp(event.target.value)} /></label><label>Motivo<textarea required minLength={1} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
       <button disabled={pending || !accepted.length}>{pending ? 'Salvando…' : 'Registrar correção'}</button>{message && <p className="form-message">{message}</p>}
     </form></section>;
+}
+
+function ManualPunchForm({ companyId, employees, locations, token, onSaved }: { companyId: string; employees: Employee[]; locations: Location[]; token: string; onSaved: () => void }) {
+  const activeEmployees = employees.filter((item) => item.active); const activeLocations = locations.filter((item) => item.active);
+  const [employeeId, setEmployeeId] = useState(''); const [locationId, setLocationId] = useState(''); const [timestamp, setTimestamp] = useState(''); const [reason, setReason] = useState('');
+  const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  useEffect(() => { if (!activeEmployees.some((item) => item.id === employeeId)) setEmployeeId(activeEmployees[0]?.id ?? ''); if (!activeLocations.some((item) => item.id === locationId)) setLocationId(activeLocations[0]?.id ?? ''); }, [activeEmployees, activeLocations, employeeId, locationId]);
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    try {
+      await api('/v1/manual-punches', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employeeId, location_id: locationId, corrected_timestamp: new Date(timestamp).toISOString(), reason }) });
+      setMessage('Marcação incluída e jornada enviada para recálculo.'); setReason(''); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível incluir a marcação.'); }
+    finally { setPending(false); }
+  }
+  return <section className="panel adjustment"><h2>Incluir batida esquecida</h2><p>Use quando não existe uma marcação para corrigir. A inclusão fica registrada com o motivo e recalcula a jornada.</p><form onSubmit={submit} className="adjustment-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{activeEmployees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Local<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Data e horário<input required type="datetime-local" value={timestamp} onChange={(event) => setTimestamp(event.target.value)} /></label><label>Motivo<textarea required minLength={1} maxLength={500} placeholder="Ex.: esqueceu de registrar a entrada" value={reason} onChange={(event) => setReason(event.target.value)} /></label><button disabled={pending || !employeeId || !locationId}>{pending ? 'Salvando…' : 'Incluir marcação'}</button>{message && <p className="form-message">{message}</p>}</form></section>;
 }
