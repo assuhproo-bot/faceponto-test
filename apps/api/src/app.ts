@@ -155,6 +155,7 @@ export function buildApp(config: ApiConfig) {
   void app.register(cors, {
     origin: config.ADMIN_ORIGIN ?? false,
     credentials: true,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
   app.decorateRequest('auth', null);
   app.setErrorHandler((cause, request, reply) => {
