@@ -14,6 +14,10 @@ export type EmployeePaymentSettings = {
   id: string; company_id: string; employee_id: string; regular_hour_cents: number; overtime_hour_cents: number;
   meal_cents: number; dinner_cents: number; daily_allowance_cents: number; night_shift_cents: number; saturday_cents: number; version: number;
 };
+export type EmployeePaymentDay = {
+  id: string; company_id: string; employee_id: string; local_date: string; meal_units: number; dinner_units: number;
+  daily_allowance_units: number; night_shift_units: number; saturday_units: number; version: number;
+};
 export type WorkDay = {
   id: string; employee_id: string; local_date: string; timezone: string;
   attendance_calculations: Array<{
