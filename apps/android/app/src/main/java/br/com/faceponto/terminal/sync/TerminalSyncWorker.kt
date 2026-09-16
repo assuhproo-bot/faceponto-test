@@ -63,10 +63,13 @@ class TerminalSyncWorker(context: Context, params: WorkerParameters) : Coroutine
 
     companion object {
         private val network = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+        fun refreshNow(context: Context) {
+            WorkManager.getInstance(context).enqueueUniqueWork("terminal-sync-now", ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<TerminalSyncWorker>().setConstraints(network).setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS).build())
+        }
         fun schedule(context: Context) {
             val manager = WorkManager.getInstance(context)
-            manager.enqueueUniqueWork("terminal-sync-now", ExistingWorkPolicy.REPLACE,
-                OneTimeWorkRequestBuilder<TerminalSyncWorker>().setConstraints(network).setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS).build())
+            refreshNow(context)
             manager.enqueueUniquePeriodicWork("terminal-sync-periodic", ExistingPeriodicWorkPolicy.UPDATE,
                 PeriodicWorkRequestBuilder<TerminalSyncWorker>(15, TimeUnit.MINUTES).setConstraints(network).build())
         }

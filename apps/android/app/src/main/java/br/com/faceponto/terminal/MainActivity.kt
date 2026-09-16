@@ -182,7 +182,14 @@ class MainActivity : ComponentActivity() {
         }
         capturing = false
     }
-    LaunchedEffect(Unit) { if (!granted) permission.launch(Manifest.permission.CAMERA); TerminalSyncWorker.schedule(context) }
+    LaunchedEffect(Unit) {
+        if (!granted) permission.launch(Manifest.permission.CAMERA)
+        TerminalSyncWorker.schedule(context)
+        while (true) {
+            delay(30_000)
+            TerminalSyncWorker.refreshNow(context)
+        }
+    }
     val employeeName = localMatch?.employeeName?.trim()?.substringBefore(' ') ?: ""
     val punchAccepted = captureMessage?.startsWith("Ponto registrado.") == true
     val title = when {
