@@ -451,7 +451,7 @@ export function buildApp(config: ApiConfig) {
   });
   app.get('/v1/punches', async (request, reply) => {
     const query = punchesQuery.parse(request.query);
-    let builder = request.auth!.db.from('time_punches').select('id,employee_id,company_id,location_id,terminal_id,timestamp,device_timestamp,server_timestamp,punch_type,source,sync_status,clock_status,result_code,created_at,employees(name,registration)')
+    let builder = request.auth!.db.from('time_punches').select('id,employee_id,company_id,location_id,terminal_id,timestamp,device_timestamp,server_timestamp,punch_type,source,sync_status,clock_status,result_code,created_at,employees(name,registration),locations(name)')
       .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
     if (query.location_id) builder = builder.eq('location_id', query.location_id);
@@ -459,7 +459,7 @@ export function buildApp(config: ApiConfig) {
     if (query.punch_to) builder = builder.lt('timestamp', query.punch_to);
     const { data, error: dbError } = await builder;
     if (dbError) return mapDatabaseError(reply, request, dbError);
-    let manualBuilder = request.auth!.db.from('manual_punches').select('id,employee_id,company_id,location_id,timestamp,reason,created_at,employees(name,registration)')
+    let manualBuilder = request.auth!.db.from('manual_punches').select('id,employee_id,company_id,location_id,timestamp,reason,created_at,employees(name,registration),locations(name)')
       .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
     if (query.employee_id) manualBuilder = manualBuilder.eq('employee_id', query.employee_id);
     if (query.location_id) manualBuilder = manualBuilder.eq('location_id', query.location_id);
@@ -467,13 +467,15 @@ export function buildApp(config: ApiConfig) {
     if (query.punch_to) manualBuilder = manualBuilder.lt('timestamp', query.punch_to);
     const { data: manualData, error: manualError } = await manualBuilder;
     if (manualError) return mapDatabaseError(reply, request, manualError);
-    const namedPunches = (data ?? []).map(({ employees, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }> } & Record<string, unknown>) => {
+    const namedPunches = (data ?? []).map(({ employees, locations, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }>; locations?: { name?: string } | Array<{ name?: string }> } & Record<string, unknown>) => {
       const employee = Array.isArray(employees) ? employees[0] : employees;
-      return { ...punch, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
+      const location = Array.isArray(locations) ? locations[0] : locations;
+      return { ...punch, location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
     });
-    const namedManualPunches = (manualData ?? []).map(({ employees, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }> } & Record<string, unknown>) => {
+    const namedManualPunches = (manualData ?? []).map(({ employees, locations, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }>; locations?: { name?: string } | Array<{ name?: string }> } & Record<string, unknown>) => {
       const employee = Array.isArray(employees) ? employees[0] : employees;
-      return { ...punch, source: 'manual', punch_type: 'unclassified', sync_status: 'accepted', clock_status: 'verified', employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
+      const location = Array.isArray(locations) ? locations[0] : locations;
+      return { ...punch, source: 'manual', punch_type: 'unclassified', sync_status: 'accepted', clock_status: 'verified', location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
     });
     const allPunches = [...namedPunches, ...namedManualPunches] as unknown as Array<Record<string, unknown> & { timestamp: string }>;
     return { data: allPunches.sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, 200) };

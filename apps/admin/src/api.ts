@@ -7,7 +7,7 @@ export type CompanyMembership = {
 export type Me = { user: { id: string; email: string | null }; memberships: CompanyMembership[] };
 export type Punch = {
   id: string; employee_id: string; timestamp: string; punch_type: string; sync_status: string; clock_status: string;
-  source: string; reason?: string; employee_name: string | null; employee_registration: string | null;
+  source: string; reason?: string; location_name: string | null; employee_name: string | null; employee_registration: string | null;
 };
 export type FacialProfileStatus = { employee_id: string; profile_version: number; prepared_at: string };
 export type WorkDay = {
@@ -15,6 +15,7 @@ export type WorkDay = {
   attendance_calculations: Array<{
     id: string; revision: number; state: string; planned_minutes: number; worked_minutes: number | null;
     late_minutes: number | null; gross_overtime_minutes: number | null; net_balance_minutes: number | null;
+    classifications: Array<{ event_id: string; type: string }>;
   }>;
 };
 export type Occurrence = {
