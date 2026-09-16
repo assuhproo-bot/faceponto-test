@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.graphics.Matrix
 import android.graphics.Bitmap
+import android.media.AudioManager
+import android.media.ToneGenerator
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -165,7 +167,7 @@ class MainActivity : ComponentActivity() {
                 is PadDecision.Passed -> {
                     android.util.Log.i("FacePontoPad", "test_pad_passed; persisting")
                     runCatching { persistFacePunch(context, match.employeeId, decision) }.fold(
-                        onSuccess = { android.util.Log.i("FacePontoPad", "punch_persisted"); "Ponto registrado. Afaste o rosto para liberar a próxima marcação." to true },
+                        onSuccess = { android.util.Log.i("FacePontoPad", "punch_persisted"); "Ponto registrado com sucesso. Afaste o rosto para liberar a próxima marcação." to true },
                         onFailure = { android.util.Log.e("FacePontoPad", "punch_persist_failed", it); "Não foi possível registrar: ${it.message ?: "dados incompletos"}" to false },
                     )
                 }
@@ -191,7 +193,15 @@ class MainActivity : ComponentActivity() {
         }
     }
     val employeeName = localMatch?.employeeName?.trim()?.substringBefore(' ') ?: ""
-    val punchAccepted = captureMessage?.startsWith("Ponto registrado.") == true
+    val punchAccepted = captureMessage?.startsWith("Ponto registrado") == true
+    LaunchedEffect(punchAccepted) {
+        if (punchAccepted) {
+            val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
+            tone.startTone(ToneGenerator.TONE_PROP_ACK, 180)
+            delay(230)
+            tone.release()
+        }
+    }
     val title = when {
         punchAccepted && employeeName.isNotBlank() -> "${timeGreeting()}, $employeeName!"
         requireFaceExit && employeeName.isNotBlank() -> "Obrigado, $employeeName!"
@@ -210,7 +220,7 @@ class MainActivity : ComponentActivity() {
     Column(Modifier.fillMaxSize().background(Color(0xFFF3F7F4)).padding(horizontal = 20.dp, vertical = 28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("FACEPONTO", fontSize = 14.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp, color = Color(0xFF2B6B55))
         Text(title, fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color(0xFF12372A), textAlign = TextAlign.Center)
-        Text(if (punchAccepted) "Sua marcação foi registrada." else "Olhe para a câmera para registrar sua jornada.", fontSize = 16.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
+        Text(if (punchAccepted) "Ponto registrado com sucesso." else "Olhe para a câmera para registrar sua jornada.", fontSize = 16.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
         Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black, RoundedCornerShape(28.dp)), contentAlignment = Alignment.Center) { if (granted) CameraPreview(engine, { observation = it.observation; embedding = it.embedding; passivePadScore = it.passivePadScore }, Modifier.fillMaxSize()) else Text("Permita o uso da câmera", color = Color.White) }
         Surface(color = if (punchAccepted) Color(0xFFD9F7E5) else Color.White, shape = RoundedCornerShape(18.dp), tonalElevation = 1.dp, modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {

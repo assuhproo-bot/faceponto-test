@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { createClient, type Session } from '@supabase/supabase-js';
-import { api, ApiError, type BankEntry, type Employee, type EmployeeLocation, type EmployeeRegistrationRequest, type EmployeeSchedulePlan, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
+import { api, ApiError, type BankEntry, type Employee, type EmployeeLocation, type EmployeeRegistrationRequest, type EmployeeSchedulePlan, type FacialProfileStatus, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
 const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined;
@@ -11,7 +11,7 @@ const pendingCompanyKey = 'faceponto.pending-company';
 type DashboardData = {
   days: WorkDay[]; occurrences: Occurrence[]; bank: BankEntry[]; balance: number; punches: Punch[]; adjustments: PunchAdjustment[];
   employees: Employee[]; locations: Location[]; employeeLocations: EmployeeLocation[]; registrationRequests: EmployeeRegistrationRequest[];
-  schedules: Schedule[]; scheduleAssignments: ScheduleAssignmentRecord[]; dailyPlans: EmployeeSchedulePlan[]; terminals: Terminal[];
+  facialProfiles: FacialProfileStatus[]; schedules: Schedule[]; scheduleAssignments: ScheduleAssignmentRecord[]; dailyPlans: EmployeeSchedulePlan[]; terminals: Terminal[];
 };
 
 function minutes(value: number | null | undefined) {
@@ -130,6 +130,10 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
     }
   }, [bootstrapAttempted, me, session.access_token]);
   useEffect(() => {
+    const timer = window.setInterval(() => setRefresh((value) => value + 1), 20_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
     if (!companyId) { setLoading(false); return; }
     let active = true; setLoading(true); setError('');
     const query = { company_id: companyId, date_from: from || undefined, date_to: to || undefined };
@@ -139,7 +143,8 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       api<{ data: BankEntry[]; balance_minutes: number }>(withQuery('/v1/bank-hours', query), session.access_token),
       api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId }), session.access_token),
       api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId }), session.access_token),
-      api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId, active: 'true' }), session.access_token),
+      api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
+      api<{ data: FacialProfileStatus[] }>(withQuery('/v1/facial-profiles', { company_id: companyId }), session.access_token),
       api<{ data: EmployeeLocation[] }>(withQuery('/v1/employee-locations', { company_id: companyId }), session.access_token),
       api<{ data: EmployeeRegistrationRequest[] }>(withQuery('/v1/employee-registration-requests', { company_id: companyId }), session.access_token),
       api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
@@ -147,8 +152,8 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       api<{ data: ScheduleAssignmentRecord[] }>(withQuery('/v1/schedule-assignments', { company_id: companyId }), session.access_token),
       api<{ data: EmployeeSchedulePlan[] }>(withQuery('/v1/employee-schedule-plans', { company_id: companyId }), session.access_token),
       api<{ data: Terminal[] }>(withQuery('/v1/terminals', { company_id: companyId }), session.access_token),
-    ]).then(([attendance, occurrences, bank, punches, adjustments, employees, employeeLocations, registrationRequests, locations, schedules, scheduleAssignments, dailyPlans, terminals]) => {
-      if (active) setData({ days: attendance.data, occurrences: occurrences.data, bank: bank.data, balance: bank.balance_minutes, punches: punches.data, adjustments: adjustments.data, employees: employees.data, employeeLocations: employeeLocations.data, registrationRequests: registrationRequests.data, locations: locations.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data, terminals: terminals.data });
+    ]).then(([attendance, occurrences, bank, punches, adjustments, employees, facialProfiles, employeeLocations, registrationRequests, locations, schedules, scheduleAssignments, dailyPlans, terminals]) => {
+      if (active) setData({ days: attendance.data, occurrences: occurrences.data, bank: bank.data, balance: bank.balance_minutes, punches: punches.data, adjustments: adjustments.data, employees: employees.data, facialProfiles: facialProfiles.data, employeeLocations: employeeLocations.data, registrationRequests: registrationRequests.data, locations: locations.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data, terminals: terminals.data });
     }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar os dados.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
@@ -165,10 +170,11 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       <SetupGuide companyId={companyId} locations={data?.locations ?? []} employees={data?.employees ?? []} terminals={data?.terminals ?? []} schedules={data?.schedules ?? []} />
       <ReportDownloads companyId={companyId} from={from} to={to} token={session.access_token} />
       <section className="metrics"><Metric label="Jornadas" value={String(data?.days.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label="Saldo no período" value={minutes(data?.balance)} /></section>
+      <RecentPunches values={data?.punches ?? []} />
       <section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section>
       <RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onUseForRegistration={setRegistrationDraft} onSaved={() => setRefresh((value) => value + 1)} />
-      <section className="grid employees-grid"><Employees values={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /></section>
-      <FacialProfileProvisioning employees={data?.employees ?? []} companyId={companyId} token={session.access_token} />
+      <section className="grid employees-grid"><Employees values={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /></section>
+      <FacialProfileProvisioning employees={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
       <Terminals values={data?.terminals ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
@@ -176,7 +182,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       <DailySchedulePlans values={data?.dailyPlans ?? []} employees={data?.employees ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <ScheduleAssignments values={data?.scheduleAssignments ?? []} employees={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <AdjustmentForm companyId={companyId} punches={data?.punches ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
-      <Adjustments values={data?.adjustments ?? []} />
+      <Adjustments values={data?.adjustments ?? []} employees={data?.employees ?? []} />
     </>}
   </main>;
 }
@@ -224,9 +230,11 @@ function OccurrenceRow({ occurrence, companyId, token, onSaved }: { occurrence: 
 }
 function Bank({ values }: { values: BankEntry[] }) { return <section className="panel"><h2>Banco de horas</h2><div className="table-wrap"><table><thead><tr><th>Quando</th><th>Motivo</th><th>Saldo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{dateTime(item.created_at)}</td><td>{item.reason}</td><td>{minutes(item.delta_minutes)}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div></section>; }
 function Empty({ colSpan }: { colSpan: number }) { return <tr><td colSpan={colSpan} className="empty">Nenhum registro para este filtro.</td></tr>; }
-function Adjustments({ values }: { values: PunchAdjustment[] }) { return <section className="panel adjustments"><h2>Correções recentes</h2><div className="table-wrap"><table><thead><tr><th>Registrada</th><th>Novo horário</th><th>Motivo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{dateTime(item.created_at)}</td><td>{dateTime(item.corrected_timestamp)}</td><td>{item.reason}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div></section>; }
-function Employees({ values, companyId, token, onSaved }: { values: Employee[]; companyId: string; token: string; onSaved: () => void }) { return <section className="panel employees"><h2>Funcionários ativos</h2><div className="table-wrap"><table><thead><tr><th>Matrícula</th><th>Nome</th><th>Cargo</th><th></th></tr></thead><tbody>{values.slice(0, 12).map((item) => <EmployeeRow key={item.id} employee={item} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
-function EmployeeRow({ employee, companyId, token, onSaved }: { employee: Employee; companyId: string; token: string; onSaved: () => void }) {
+function punchKind(value: string) { return ({ entry: 'Entrada', break_start: 'Início do intervalo', break_end: 'Fim do intervalo', exit: 'Saída', unclassified: 'Registrada' } as Record<string, string>)[value] ?? 'Registrada'; }
+function RecentPunches({ values }: { values: Punch[] }) { return <section className="panel recent-punches"><h2>Últimas batidas</h2><p>Atualiza automaticamente a cada 20 segundos enquanto este painel estiver aberto.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Matrícula</th><th>Quando</th><th>Tipo</th><th>Status</th></tr></thead><tbody>{values.slice(0, 12).map((item) => <tr key={item.id}><td>{item.employee_name ?? 'Funcionário não localizado'}</td><td>{item.employee_registration ?? '—'}</td><td>{dateTime(item.timestamp)}</td><td>{punchKind(item.punch_type)}</td><td>{item.sync_status === 'accepted' ? 'Confirmada' : 'Em análise'}</td></tr>)}{!values.length && <Empty colSpan={5} />}</tbody></table></div></section>; }
+function Adjustments({ values, employees }: { values: PunchAdjustment[]; employees: Employee[] }) { const name = (id: string) => employees.find((employee) => employee.id === id)?.name ?? 'Funcionário não localizado'; return <section className="panel adjustments"><h2>Correções recentes</h2><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Registrada</th><th>Novo horário</th><th>Motivo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{name(item.employee_id)}</td><td>{dateTime(item.created_at)}</td><td>{dateTime(item.corrected_timestamp)}</td><td>{item.reason}</td></tr>)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
+function Employees({ values, facialProfiles, companyId, token, onSaved }: { values: Employee[]; facialProfiles: FacialProfileStatus[]; companyId: string; token: string; onSaved: () => void }) { const prepared = new Map(facialProfiles.map((profile) => [profile.employee_id, profile])); const active = values.filter((item) => item.active); return <section className="panel employees"><h2>Funcionários ativos</h2><div className="table-wrap"><table><thead><tr><th>Matrícula</th><th>Nome</th><th>Cargo</th><th>Reconhecimento facial</th><th></th></tr></thead><tbody>{active.slice(0, 12).map((item) => <EmployeeRow key={item.id} employee={item} facialProfile={prepared.get(item.id)} companyId={companyId} token={token} onSaved={onSaved} />)}{!active.length && <Empty colSpan={5} />}</tbody></table></div></section>; }
+function EmployeeRow({ employee, facialProfile, companyId, token, onSaved }: { employee: Employee; facialProfile: FacialProfileStatus | undefined; companyId: string; token: string; onSaved: () => void }) {
   const [pending, setPending] = useState(false); const [message, setMessage] = useState('');
   async function deactivate() {
     setPending(true); setMessage('');
@@ -234,20 +242,22 @@ function EmployeeRow({ employee, companyId, token, onSaved }: { employee: Employ
     catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível desativar o funcionário.'); }
     finally { setPending(false); }
   }
-  return <tr><td>{employee.registration}</td><td>{employee.name}</td><td>{employee.job_title || '—'}</td><td><button className="secondary small-button" disabled={pending} onClick={() => void deactivate()}>Desativar</button>{message && <p className="row-message">{message}</p>}</td></tr>;
+  return <tr><td>{employee.registration}</td><td>{employee.name}</td><td>{employee.job_title || '—'}</td><td>{facialProfile ? `Perfil preparado · versão ${facialProfile.profile_version}` : 'Pendente'}</td><td><button className="secondary small-button" disabled={pending} onClick={() => void deactivate()}>Desativar</button>{message && <p className="row-message">{message}</p>}</td></tr>;
 }
-function FacialProfileProvisioning({ employees, companyId, token }: { employees: Employee[]; companyId: string; token: string }) {
+function FacialProfileProvisioning({ employees, facialProfiles, companyId, token, onSaved }: { employees: Employee[]; facialProfiles: FacialProfileStatus[]; companyId: string; token: string; onSaved: () => void }) {
   const [employeeId, setEmployeeId] = useState(''); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
-  useEffect(() => { if (!employees.some((item) => item.id === employeeId)) setEmployeeId(employees[0]?.id ?? ''); }, [employees, employeeId]);
+  const activeEmployees = employees.filter((item) => item.active);
+  useEffect(() => { if (!activeEmployees.some((item) => item.id === employeeId)) setEmployeeId(activeEmployees[0]?.id ?? ''); }, [activeEmployees, employeeId]);
   async function provision(event: FormEvent) {
     event.preventDefault(); setPending(true); setMessage('');
     try {
       const profile = await api<{ version: number }>('/v1/facial-profiles', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employeeId }) });
-      setMessage(`Perfil de teste versão ${profile.version} provisionado. Abra o terminal para atualizar o catálogo.`);
+      setMessage(`Perfil versão ${profile.version} preparado. O terminal atualiza o catálogo automaticamente.`); onSaved();
     } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível provisionar o perfil.'); }
     finally { setPending(false); }
   }
-  return <section className="panel facial-profile"><h2>Preparar reconhecimento facial</h2><p>Escolha o funcionário antes de abrir o terminal. Depois, no aparelho, o responsável cadastra a amostra facial. A amostra fica cifrada somente no aparelho; aqui ficam apenas a versão e as regras de validação.</p><form onSubmit={provision} className="inline-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !employeeId}>{pending ? 'Preparando…' : 'Preparar no terminal'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
+  const prepared = new Map(facialProfiles.map((profile) => [profile.employee_id, profile]));
+  return <section className="panel facial-profile"><h2>Preparar reconhecimento facial</h2><p>O painel mostra quando o perfil foi preparado para o terminal. Depois, no aparelho, o responsável cadastra a amostra facial. A amostra fica cifrada somente no aparelho.</p><form onSubmit={provision} className="inline-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{activeEmployees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !employeeId}>{pending ? 'Preparando…' : 'Preparar no terminal'}</button></form><p className="form-message">{activeEmployees.map((employee) => `${employee.name}: ${prepared.has(employee.id) ? `perfil preparado (versão ${prepared.get(employee.id)!.profile_version})` : 'pendente'}`).join(' · ') || 'Cadastre um funcionário para preparar o reconhecimento facial.'}</p>{message && <p className="form-message">{message}</p>}</section>;
 }
 function EmployeeLocations({ values, employees, locations, companyId, token, onSaved }: { values: EmployeeLocation[]; employees: Employee[]; locations: Location[]; companyId: string; token: string; onSaved: () => void }) {
   const [employeeId, setEmployeeId] = useState(''); const [locationId, setLocationId] = useState(''); const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
@@ -442,7 +452,7 @@ function AdjustmentForm({ companyId, punches, token, onSaved }: { companyId: str
     finally { setPending(false); }
   }
   return <section className="panel adjustment"><h2>Corrigir batida</h2><p>A batida original não é alterada. Informe o motivo para criar uma correção auditável.</p>
-    <form onSubmit={submit} className="adjustment-form"><label>Batida<select required value={punchId} onChange={(event) => setPunchId(event.target.value)}><option value="">Selecione uma batida aceita</option>{accepted.map((item) => <option key={item.id} value={item.id}>{dateTime(item.timestamp)} · {item.employee_id.slice(0, 8)}</option>)}</select></label>
+    <form onSubmit={submit} className="adjustment-form"><label>Batida<select required value={punchId} onChange={(event) => setPunchId(event.target.value)}><option value="">Selecione uma batida aceita</option>{accepted.map((item) => <option key={item.id} value={item.id}>{dateTime(item.timestamp)} · {item.employee_name ?? 'Funcionário não localizado'}{item.employee_registration ? ` (${item.employee_registration})` : ''}</option>)}</select></label>
       <label>Novo horário<input required type="datetime-local" value={timestamp} onChange={(event) => setTimestamp(event.target.value)} /></label><label>Motivo<textarea required minLength={1} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
       <button disabled={pending || !accepted.length}>{pending ? 'Salvando…' : 'Registrar correção'}</button>{message && <p className="form-message">{message}</p>}
     </form></section>;
