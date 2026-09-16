@@ -163,9 +163,10 @@ class MainActivity : ComponentActivity() {
             if (it.count == 0 && movementChallenge.step != MovementStep.CENTER) {
                 movementChallenge = MovementChallengeState.create()
                 padFrames = emptyList()
-                captureMessage = "Desafio interrompido. Mantenha o rosto na câmera durante todas as etapas."
+                captureMessage = "Rosto saiu da câmera. Vamos recomeçar quando você voltar."
                 return@let
             }
+            if (captureMessage?.startsWith("Rosto saiu da câmera") == true) captureMessage = null
             val now = android.os.SystemClock.elapsedRealtime()
             val advanced = movementChallenge.advance(it, localMatch != null, now)
             movementChallenge = advanced
