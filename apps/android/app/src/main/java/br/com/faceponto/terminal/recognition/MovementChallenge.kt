@@ -2,32 +2,37 @@ package br.com.faceponto.terminal.recognition
 
 import kotlin.random.Random
 
-enum class MovementStep { CENTER, FIRST_SIDE, OPPOSITE_SIDE, COMPLETE }
+enum class MovementStep { CENTER, FIRST_SIDE, OPPOSITE_SIDE, FINAL_CENTER, COMPLETE }
 
 data class MovementChallengeState(
     val step: MovementStep = MovementStep.CENTER,
     val firstWasLeft: Boolean = false,
     val stableFrames: Int = 0,
     val lastValidElapsedMs: Long = 0,
+    val startedElapsedMs: Long = 0,
 ) {
     val instruction: String get() = when (step) {
         MovementStep.CENTER -> "Centralize o rosto para iniciar"
         MovementStep.FIRST_SIDE -> if (firstWasLeft) "Vire a cabeça para a esquerda" else "Vire a cabeça para a direita"
         MovementStep.OPPOSITE_SIDE -> if (firstWasLeft) "Agora vire a cabeça para a direita" else "Agora vire a cabeça para a esquerda"
+        MovementStep.FINAL_CENTER -> "Agora olhe para frente"
         MovementStep.COMPLETE -> "Presença confirmada"
     }
 
     fun advance(observation: FaceObservation, identified: Boolean, nowElapsedMs: Long): MovementChallengeState {
-        if (lastValidElapsedMs > 0 && nowElapsedMs - lastValidElapsedMs > SESSION_TIMEOUT_MS) return create()
         if (!identified || !observation.usable || observation.yawRatio == null) return this
         val position = observation.yawRatio
-        return when (step) {
+        val next = when (step) {
             MovementStep.CENTER -> accumulate(position in CENTER_MIN..CENTER_MAX, MovementStep.FIRST_SIDE)
             MovementStep.FIRST_SIDE -> accumulate(if (firstWasLeft) position <= SIDE_MIN else position >= SIDE_MAX, MovementStep.OPPOSITE_SIDE)
-            MovementStep.OPPOSITE_SIDE -> accumulate(if (firstWasLeft) position >= SIDE_MAX else position <= SIDE_MIN, MovementStep.COMPLETE)
+            MovementStep.OPPOSITE_SIDE -> accumulate(if (firstWasLeft) position >= SIDE_MAX else position <= SIDE_MIN, MovementStep.FINAL_CENTER)
+            MovementStep.FINAL_CENTER -> accumulate(position in CENTER_MIN..CENTER_MAX, MovementStep.COMPLETE)
             MovementStep.COMPLETE -> this
-        }.copy(lastValidElapsedMs = nowElapsedMs)
+        }
+        return next.copy(lastValidElapsedMs = nowElapsedMs, startedElapsedMs = if (startedElapsedMs == 0L) nowElapsedMs else startedElapsedMs)
     }
+
+    fun timedOut(nowElapsedMs: Long): Boolean = startedElapsedMs > 0 && nowElapsedMs - startedElapsedMs > SESSION_TIMEOUT_MS
 
     private fun accumulate(condition: Boolean, next: MovementStep): MovementChallengeState {
         if (!condition) return copy(stableFrames = 0)
@@ -36,12 +41,12 @@ data class MovementChallengeState(
     }
 
     companion object {
-        private const val CENTER_MIN = .38f
-        private const val CENTER_MAX = .62f
-        private const val SIDE_MIN = .36f
-        private const val SIDE_MAX = .64f
-        private const val REQUIRED_FRAMES = 3
-        private const val SESSION_TIMEOUT_MS = 5_000L
+        private const val CENTER_MIN = .42f
+        private const val CENTER_MAX = .58f
+        private const val SIDE_MIN = .40f
+        private const val SIDE_MAX = .60f
+        private const val REQUIRED_FRAMES = 2
+        private const val SESSION_TIMEOUT_MS = 12_000L
         fun create(): MovementChallengeState = MovementChallengeState(firstWasLeft = Random.nextBoolean())
     }
 }

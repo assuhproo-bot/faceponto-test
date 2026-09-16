@@ -152,6 +152,10 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
         }
     }
     var localMatch by remember { mutableStateOf<LocalMatch?>(null) }
+    // A face is identified while frontal.  Side profiles are intentionally less
+    // similar to the enrolled frontal sample, so retain that verified identity
+    // only for the short active-presence challenge.
+    var challengeMatch by remember { mutableStateOf<LocalMatch?>(null) }
     var movementChallenge by remember { mutableStateOf(MovementChallengeState.create()) }
     var padFrames by remember { mutableStateOf(emptyList<PadFrame>()) }
     var requireFaceExit by remember { mutableStateOf(false) }
@@ -170,6 +174,7 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
                 if (it.count == 0) {
                     requireFaceExit = false
                     movementChallenge = MovementChallengeState.create()
+                    challengeMatch = null
                     padFrames = emptyList()
                     captureMessage = "Ponto registrado. Pronto para a próxima marcação."
                 }
@@ -177,21 +182,34 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
             }
             if (it.count == 0 && movementChallenge.step != MovementStep.CENTER) {
                 movementChallenge = MovementChallengeState.create()
+                challengeMatch = null
                 padFrames = emptyList()
                 captureMessage = "Rosto saiu da câmera. Vamos recomeçar quando você voltar."
                 return@let
             }
             if (captureMessage?.startsWith("Rosto saiu da câmera") == true) captureMessage = null
             val now = android.os.SystemClock.elapsedRealtime()
-            val advanced = movementChallenge.advance(it, localMatch != null, now)
+            if (movementChallenge.timedOut(now)) {
+                movementChallenge = MovementChallengeState.create()
+                challengeMatch = null
+                padFrames = emptyList()
+                captureMessage = "Tempo esgotado. Vamos tentar novamente."
+                return@let
+            }
+            if (movementChallenge.step == MovementStep.CENTER && localMatch != null && it.usable) {
+                challengeMatch = localMatch
+            }
+            val activeMatch = challengeMatch ?: localMatch
+            val advanced = movementChallenge.advance(it, activeMatch != null, now)
             movementChallenge = advanced
-            if (localMatch != null && it.usable) {
+            if (captureMessage?.startsWith("Tempo esgotado") == true && advanced.step != MovementStep.CENTER) captureMessage = null
+            if (activeMatch != null && it.usable) {
                 padFrames = (padFrames + PadFrame(now, it.confidence, advanced.step == MovementStep.COMPLETE, passivePadScore)).takeLast(12)
             }
         }
     }
     LaunchedEffect(movementChallenge.step) {
-        val match = localMatch ?: return@LaunchedEffect
+        val match = challengeMatch ?: localMatch ?: return@LaunchedEffect
         if (!ActivePresencePolicy.passed(movementChallenge) || capturing || requireFaceExit) return@LaunchedEffect
         capturing = true
         captureMessage = "Registrando ponto localmente..."
@@ -214,6 +232,7 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
         if (!requireFaceExit) {
             delay(1_500)
             movementChallenge = MovementChallengeState.create()
+            challengeMatch = null
             padFrames = emptyList()
         }
         capturing = false
@@ -226,14 +245,22 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
             TerminalSyncWorker.refreshNow(context)
         }
     }
-    val employeeName = localMatch?.employeeName?.trim()?.substringBefore(' ') ?: ""
+    val employeeName = (challengeMatch ?: localMatch)?.employeeName?.trim()?.substringBefore(' ') ?: ""
     val punchAccepted = captureMessage?.startsWith("Ponto registrado") == true
     val spokenConfirmation = when {
         captureMessage?.startsWith("Ponto registrado com sucesso") == true -> "${employeeName.ifBlank { "Funcionário" }}, ponto registrado com sucesso."
-        captureMessage?.startsWith("Rosto saiu da câmera") == true || captureMessage?.startsWith("Presença recusada") == true || captureMessage?.startsWith("Não foi possível registrar") == true -> "Não foi possível verificar. Tente novamente."
+        captureMessage?.startsWith("Rosto saiu da câmera") == true || captureMessage?.startsWith("Tempo esgotado") == true || captureMessage?.startsWith("Presença recusada") == true || captureMessage?.startsWith("Não foi possível registrar") == true -> "Não foi possível verificar. Tente novamente."
         else -> null
     }
     LaunchedEffect(spokenConfirmation) { spokenConfirmation?.let(voice::say) }
+    LaunchedEffect(movementChallenge.step) {
+        if (challengeMatch == null && localMatch == null || capturing || requireFaceExit) return@LaunchedEffect
+        when (movementChallenge.step) {
+            MovementStep.FIRST_SIDE, MovementStep.OPPOSITE_SIDE, MovementStep.FINAL_CENTER -> voice.say(movementChallenge.instruction)
+            MovementStep.COMPLETE -> voice.say("Verificando ponto.")
+            MovementStep.CENTER -> Unit
+        }
+    }
     LaunchedEffect(punchAccepted) {
         if (punchAccepted) {
             val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
@@ -253,7 +280,7 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
         requireFaceExit -> "Pode se afastar."
         observation?.count == 0 -> "Posicione o rosto no centro da câmera"
         observation?.count ?: 0 > 1 -> "Apenas uma pessoa por vez"
-        localMatch != null && !capturing -> movementChallenge.instruction
+        (challengeMatch != null || localMatch != null) && !capturing -> movementChallenge.instruction
         observation?.usable == true -> "Rosto ainda não cadastrado neste terminal"
         else -> "Ajuste a posição e a iluminação"
     }
@@ -265,7 +292,7 @@ private class FacePontoVoice(context: android.content.Context) : TextToSpeech.On
         if (!punchAccepted) Surface(color = Color.White, shape = RoundedCornerShape(18.dp), tonalElevation = 1.dp, modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(status, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF12372A), textAlign = TextAlign.Center)
-                if (!punchAccepted && localMatch != null && movementChallenge.step != MovementStep.CENTER) Text("Siga a orientação sem sair da câmera.", fontSize = 14.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
+                if (!punchAccepted && (challengeMatch != null || localMatch != null) && movementChallenge.step != MovementStep.CENTER) Text("Siga a orientação sem sair da câmera.", fontSize = 14.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
             }
         }
         if (BuildConfig.DEBUG) Surface(color = Color(0xFFFFF4D6), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
