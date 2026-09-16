@@ -105,6 +105,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
   const [me, setMe] = useState<Me | null>(null); const [companyId, setCompanyId] = useState('');
   const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState(''); const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0);
+  const [registrationDraft, setRegistrationDraft] = useState<EmployeeRegistrationRequest | null>(null);
   const [accountRefresh, setAccountRefresh] = useState(0); const [bootstrapAttempted, setBootstrapAttempted] = useState(false);
   useEffect(() => { void api<Me>('/v1/me', session.access_token).then((value) => {
     setMe(value); setCompanyId((previous) => previous || value.memberships[0]?.company_id || '');
@@ -140,7 +141,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId }), session.access_token),
       api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId, active: 'true' }), session.access_token),
       api<{ data: EmployeeLocation[] }>(withQuery('/v1/employee-locations', { company_id: companyId }), session.access_token),
-      api<{ data: EmployeeRegistrationRequest[] }>(withQuery('/v1/employee-registration-requests', { company_id: companyId, status: 'pending' }), session.access_token),
+      api<{ data: EmployeeRegistrationRequest[] }>(withQuery('/v1/employee-registration-requests', { company_id: companyId }), session.access_token),
       api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
       api<{ data: Schedule[] }>(withQuery('/v1/schedules', { company_id: companyId }), session.access_token),
       api<{ data: ScheduleAssignmentRecord[] }>(withQuery('/v1/schedule-assignments', { company_id: companyId }), session.access_token),
@@ -165,8 +166,8 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       <ReportDownloads companyId={companyId} from={from} to={to} token={session.access_token} />
       <section className="metrics"><Metric label="Jornadas" value={String(data?.days.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label="Saldo no período" value={minutes(data?.balance)} /></section>
       <section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section>
-      <section className="grid employees-grid"><Employees values={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
-      <RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
+      <RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onUseForRegistration={setRegistrationDraft} onSaved={() => setRefresh((value) => value + 1)} />
+      <section className="grid employees-grid"><Employees values={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /></section>
       <FacialProfileProvisioning employees={data?.employees ?? []} companyId={companyId} token={session.access_token} />
       <EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
@@ -264,30 +265,41 @@ function EmployeeLocations({ values, employees, locations, companyId, token, onS
   const locationName = (id: string) => locations.find((item) => item.id === id)?.name ?? id.slice(0, 8);
   return <section className="panel employee-locations"><h2>Autorizar outros locais</h2><p>O local principal continua definido no cadastro. Os vínculos abaixo permitem registrar ponto em outros locais a partir da data informada.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Local autorizado</th><th>Válido desde</th></tr></thead><tbody>{values.map((item) => <tr key={item.id}><td>{name(item.employee_id)}</td><td>{locationName(item.location_id)}</td><td>{dateTime(item.valid_from)}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div><form onSubmit={submit} className="inline-form employee-location-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Local adicional<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Válido desde<input required type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><button disabled={pending || !employeeId || !locationId}>{pending ? 'Salvando…' : 'Autorizar local'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
 }
-function EmployeeForm({ companyId, locations, token, onSaved }: { companyId: string; locations: Location[]; token: string; onSaved: () => void }) {
+function EmployeeForm({ companyId, locations, token, draft, onDraftSaved, onSaved }: { companyId: string; locations: Location[]; token: string; draft: EmployeeRegistrationRequest | null; onDraftSaved: () => void; onSaved: () => void }) {
   const [registration, setRegistration] = useState(''); const [name, setName] = useState(''); const [jobTitle, setJobTitle] = useState(''); const [locationId, setLocationId] = useState('');
   const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
   const activeLocations = locations.filter((item) => item.active);
   useEffect(() => { if (!activeLocations.some((item) => item.id === locationId)) setLocationId(activeLocations[0]?.id ?? ''); }, [companyId, locations, locationId, activeLocations]);
+  useEffect(() => {
+    if (!draft) return;
+    setRegistration(draft.registration ?? ''); setName(draft.name); setJobTitle('');
+    setMessage(draft.registration ? 'Dados da solicitação preenchidos. Confira o local e conclua o cadastro.' : 'Dados da solicitação preenchidos. Informe a matrícula, confira o local e conclua o cadastro.');
+    document.getElementById('employee-registration-form')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [draft]);
   async function submit(event: FormEvent) {
     event.preventDefault(); setPending(true); setMessage('');
     try {
       await api('/v1/employees', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, registration, name, job_title: jobTitle, home_location_id: locationId }) });
-      setMessage('Funcionário cadastrado.'); setRegistration(''); setName(''); setJobTitle(''); onSaved();
+      setMessage('Funcionário cadastrado.'); setRegistration(''); setName(''); setJobTitle(''); onDraftSaved(); onSaved();
     } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível cadastrar o funcionário.'); }
     finally { setPending(false); }
   }
-  return <section className="panel employee-form"><h2>Cadastrar funcionário</h2><p>O funcionário não precisa criar senha nem acessar este painel. Cadastre os dados uma vez e depois prepare o reconhecimento facial no terminal.</p><form onSubmit={submit}><label>Matrícula<input required maxLength={40} value={registration} onChange={(event) => setRegistration(event.target.value)} /></label><label>Nome<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><label>Cargo<input maxLength={160} value={jobTitle} onChange={(event) => setJobTitle(event.target.value)} /></label><label>Local principal<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Cadastre um local primeiro</option>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !locationId}>{pending ? 'Salvando…' : 'Cadastrar funcionário'}</button>{message && <p className="form-message">{message}</p>}</form></section>;
+  return <section id="employee-registration-form" className="panel employee-form"><h2>Cadastrar funcionário</h2><p>Selecione “Cadastrar com estes dados” em uma solicitação analisada para preencher este formulário. Depois confira a matrícula e o local principal.</p><form onSubmit={submit}><label>Matrícula<input required maxLength={40} value={registration} onChange={(event) => setRegistration(event.target.value)} /></label><label>Nome<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><label>Cargo<input maxLength={160} value={jobTitle} onChange={(event) => setJobTitle(event.target.value)} /></label><label>Local principal<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Cadastre um local primeiro</option>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !locationId}>{pending ? 'Salvando…' : 'Cadastrar funcionário'}</button>{message && <p className="form-message">{message}</p>}</form></section>;
 }
-function RegistrationRequests({ values, companyId, token, onSaved }: { values: EmployeeRegistrationRequest[]; companyId: string; token: string; onSaved: () => void }) {
+function RegistrationRequests({ values, companyId, token, onUseForRegistration, onSaved }: { values: EmployeeRegistrationRequest[]; companyId: string; token: string; onUseForRegistration: (request: EmployeeRegistrationRequest) => void; onSaved: () => void }) {
   const [pending, setPending] = useState<string | null>(null); const [message, setMessage] = useState('');
-  async function review(id: string, status: 'reviewed' | 'declined') {
-    setPending(id); setMessage('');
-    try { await api(`/v1/employee-registration-requests/${id}`, token, { method: 'PATCH', body: JSON.stringify({ company_id: companyId, status }) }); setMessage(status === 'reviewed' ? 'Solicitação analisada. Use os dados acima para cadastrar o funcionário.' : 'Solicitação recusada.'); onSaved(); }
-    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível analisar a solicitação.'); }
+  async function review(item: EmployeeRegistrationRequest, status: 'reviewed' | 'declined') {
+    setPending(item.id); setMessage('');
+    try {
+      await api(`/v1/employee-registration-requests/${item.id}`, token, { method: 'PATCH', body: JSON.stringify({ company_id: companyId, status }) });
+      if (status === 'reviewed') { onUseForRegistration(item); setMessage('Solicitação analisada. Os dados foram levados ao formulário de cadastro.'); }
+      else setMessage('Solicitação recusada.');
+      onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível analisar a solicitação.'); }
     finally { setPending(null); }
   }
-  return <section className="panel registration-requests"><h2>Solicitações de cadastro</h2><p>Solicitações enviadas pelo link público. Revise os dados e faça o cadastro definitivo do funcionário acima.</p><div className="table-wrap"><table><thead><tr><th>Nome</th><th>Matrícula</th><th>Contato</th><th>Observação</th><th>Recebida</th><th>Ação</th></tr></thead><tbody>{values.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.registration || '—'}</td><td>{item.contact || '—'}</td><td>{item.note || '—'}</td><td>{dateTime(item.created_at)}</td><td><div className="request-actions"><button className="secondary small-button" disabled={pending === item.id} onClick={() => void review(item.id, 'reviewed')}>{pending === item.id ? 'Salvando…' : 'Analisar'}</button><button className="secondary small-button" disabled={pending === item.id} onClick={() => void review(item.id, 'declined')}>Recusar</button></div></td></tr>)}{!values.length && <Empty colSpan={6} />}</tbody></table></div>{message && <p className="form-message">{message}</p>}</section>;
+  const statusLabel = (status: EmployeeRegistrationRequest['status']) => status === 'pending' ? 'Pendente' : status === 'reviewed' ? 'Analisada' : 'Recusada';
+  return <section className="panel registration-requests"><h2>Solicitações de cadastro</h2><p>Após analisar uma solicitação, os dados continuam aqui. Use “Cadastrar com estes dados” para preencher o formulário de funcionário automaticamente.</p><div className="table-wrap"><table><thead><tr><th>Nome</th><th>Matrícula</th><th>Contato</th><th>Observação</th><th>Status</th><th>Recebida</th><th>Ação</th></tr></thead><tbody>{values.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.registration || '—'}</td><td>{item.contact || '—'}</td><td>{item.note || '—'}</td><td>{statusLabel(item.status)}</td><td>{dateTime(item.created_at)}</td><td><div className="request-actions">{item.status === 'pending' ? <><button className="secondary small-button" disabled={pending === item.id} onClick={() => void review(item, 'reviewed')}>{pending === item.id ? 'Salvando…' : 'Analisar e cadastrar'}</button><button className="secondary small-button" disabled={pending === item.id} onClick={() => void review(item, 'declined')}>Recusar</button></> : item.status === 'reviewed' ? <button className="secondary small-button" onClick={() => onUseForRegistration(item)}>Cadastrar com estes dados</button> : '—'}</div></td></tr>)}{!values.length && <Empty colSpan={7} />}</tbody></table></div>{message && <p className="form-message">{message}</p>}</section>;
 }
 function Locations({ values, companyId, token, onSaved }: { values: Location[]; companyId: string; token: string; onSaved: () => void }) {
   const [name, setName] = useState(''); const [message, setMessage] = useState('');
