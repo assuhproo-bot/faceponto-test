@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { createClient, type Session } from '@supabase/supabase-js';
-import { api, ApiError, type BankEntry, type Employee, type EmployeeLocation, type EmployeeSchedulePlan, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
+import { api, ApiError, type BankEntry, type Employee, type EmployeeLocation, type EmployeeRegistrationRequest, type EmployeeSchedulePlan, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
 const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined;
@@ -10,7 +10,7 @@ const pendingCompanyKey = 'faceponto.pending-company';
 
 type DashboardData = {
   days: WorkDay[]; occurrences: Occurrence[]; bank: BankEntry[]; balance: number; punches: Punch[]; adjustments: PunchAdjustment[];
-  employees: Employee[]; locations: Location[]; employeeLocations: EmployeeLocation[];
+  employees: Employee[]; locations: Location[]; employeeLocations: EmployeeLocation[]; registrationRequests: EmployeeRegistrationRequest[];
   schedules: Schedule[]; scheduleAssignments: ScheduleAssignmentRecord[]; dailyPlans: EmployeeSchedulePlan[]; terminals: Terminal[];
 };
 
@@ -34,7 +34,28 @@ export function App() {
   }, []);
   if (!ready) return <main className="centered">Carregando sessão…</main>;
   if (!supabase) return <main className="centered error">Configure as variáveis públicas do Supabase para iniciar o painel.</main>;
+  const publicRegistrationCompanyId = new URLSearchParams(window.location.search).get('cadastro');
+  if (publicRegistrationCompanyId && !session) return <PublicRegistration companyId={publicRegistrationCompanyId} />;
   return session ? <Dashboard session={session} onLogout={() => void supabase.auth.signOut()} /> : <Access />;
+}
+
+function PublicRegistration({ companyId }: { companyId: string }) {
+  const [company, setCompany] = useState(''); const [name, setName] = useState(''); const [registration, setRegistration] = useState(''); const [contact, setContact] = useState(''); const [note, setNote] = useState('');
+  const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  useEffect(() => { void fetch(`${(import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')}/v1/public-registration/companies/${companyId}`).then(async (response) => {
+    if (!response.ok) throw new Error('Link de cadastro inválido ou indisponível.'); return response.json() as Promise<{ name: string }>;
+  }).then((value) => setCompany(value.name)).catch((cause) => setMessage(cause instanceof Error ? cause.message : 'Não foi possível abrir o cadastro.')); }, [companyId]);
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setPending(true); setMessage('');
+    try {
+      const response = await fetch(`${(import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')}/v1/public-registration/requests`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ company_id: companyId, name, registration: registration || undefined, contact: contact || undefined, note: note || undefined }) });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(body && typeof body === 'object' && 'message' in body && typeof body.message === 'string' ? body.message : 'Não foi possível enviar a solicitação.');
+      setMessage('Solicitação enviada. O responsável da empresa fará a análise e orientará o próximo passo.'); setName(''); setRegistration(''); setContact(''); setNote('');
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Não foi possível enviar a solicitação.'); }
+    finally { setPending(false); }
+  }
+  return <main className="access"><section className="access-card public-registration"><p className="eyebrow">FACEPONTO</p><h1>Solicitar cadastro</h1><p>{company ? `Envie seus dados para ${company}. O responsável concluirá seu cadastro antes da primeira marcação.` : 'Carregando empresa…'}</p><form onSubmit={submit}><label>Nome completo<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><label>Matrícula, se já possuir<input maxLength={40} value={registration} onChange={(event) => setRegistration(event.target.value)} /></label><label>Contato para retorno<input maxLength={160} placeholder="Telefone ou e-mail" value={contact} onChange={(event) => setContact(event.target.value)} /></label><label>Observação, se necessário<textarea maxLength={500} value={note} onChange={(event) => setNote(event.target.value)} /></label>{message && <p className="form-message">{message}</p>}<button disabled={pending || !company}>{pending ? 'Enviando…' : 'Enviar solicitação'}</button></form></section></main>;
 }
 
 function Access() {
@@ -119,13 +140,14 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId }), session.access_token),
       api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId, active: 'true' }), session.access_token),
       api<{ data: EmployeeLocation[] }>(withQuery('/v1/employee-locations', { company_id: companyId }), session.access_token),
+      api<{ data: EmployeeRegistrationRequest[] }>(withQuery('/v1/employee-registration-requests', { company_id: companyId, status: 'pending' }), session.access_token),
       api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
       api<{ data: Schedule[] }>(withQuery('/v1/schedules', { company_id: companyId }), session.access_token),
       api<{ data: ScheduleAssignmentRecord[] }>(withQuery('/v1/schedule-assignments', { company_id: companyId }), session.access_token),
       api<{ data: EmployeeSchedulePlan[] }>(withQuery('/v1/employee-schedule-plans', { company_id: companyId }), session.access_token),
       api<{ data: Terminal[] }>(withQuery('/v1/terminals', { company_id: companyId }), session.access_token),
-    ]).then(([attendance, occurrences, bank, punches, adjustments, employees, employeeLocations, locations, schedules, scheduleAssignments, dailyPlans, terminals]) => {
-      if (active) setData({ days: attendance.data, occurrences: occurrences.data, bank: bank.data, balance: bank.balance_minutes, punches: punches.data, adjustments: adjustments.data, employees: employees.data, employeeLocations: employeeLocations.data, locations: locations.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data, terminals: terminals.data });
+    ]).then(([attendance, occurrences, bank, punches, adjustments, employees, employeeLocations, registrationRequests, locations, schedules, scheduleAssignments, dailyPlans, terminals]) => {
+      if (active) setData({ days: attendance.data, occurrences: occurrences.data, bank: bank.data, balance: bank.balance_minutes, punches: punches.data, adjustments: adjustments.data, employees: employees.data, employeeLocations: employeeLocations.data, registrationRequests: registrationRequests.data, locations: locations.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data, terminals: terminals.data });
     }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar os dados.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
@@ -139,10 +161,12 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
     {!me?.memberships.length ? <p className="notice">Esta conta ainda não possui uma empresa. Crie uma conta nova para iniciar uma empresa local.</p> : <>
       <section className="filters" aria-label="Filtros"><label>Empresa<select value={companyId} onChange={(event) => setCompanyId(event.target.value)}>{me.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label>
         <label>De<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>Até<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label></section>
+      <SetupGuide companyId={companyId} locations={data?.locations ?? []} employees={data?.employees ?? []} terminals={data?.terminals ?? []} schedules={data?.schedules ?? []} />
       <ReportDownloads companyId={companyId} from={from} to={to} token={session.access_token} />
       <section className="metrics"><Metric label="Jornadas" value={String(data?.days.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label="Saldo no período" value={minutes(data?.balance)} /></section>
       <section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section>
       <section className="grid employees-grid"><Employees values={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
+      <RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <FacialProfileProvisioning employees={data?.employees ?? []} companyId={companyId} token={session.access_token} />
       <EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />
       <section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section>
@@ -157,6 +181,19 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
 }
 
 function Metric({ label, value }: { label: string; value: string }) { return <article className="metric"><span>{label}</span><strong>{value}</strong></article>; }
+function SetupGuide({ companyId, locations, employees, terminals, schedules }: { companyId: string; locations: Location[]; employees: Employee[]; terminals: Terminal[]; schedules: Schedule[] }) {
+  const linkedTerminal = terminals.some((item) => item.last_heartbeat_at);
+  const [copied, setCopied] = useState(false);
+  const registrationLink = `${window.location.origin}${window.location.pathname}?cadastro=${companyId}`;
+  const steps = [
+    { ready: locations.length > 0, title: 'Cadastre o local', text: 'Ex.: matriz, galpão ou filial.' },
+    { ready: employees.length > 0, title: 'Cadastre o funcionário', text: 'Informe matrícula, nome, cargo e local principal.' },
+    { ready: terminals.length > 0, title: 'Cadastre o terminal', text: 'Dê um nome ao tablet ou celular que fará as marcações.' },
+    { ready: linkedTerminal, title: 'Conecte o terminal', text: 'Com o app aberto no aparelho, gere o código e faça o pareamento.' },
+    { ready: schedules.length > 0, title: 'Crie a escala', text: 'Defina os períodos de trabalho para classificar entrada, intervalo e saída.' },
+  ];
+  return <section className="setup-guide"><div><p className="eyebrow">COMECE POR AQUI</p><h2>Cadastro e conexão em cinco passos</h2><p>O funcionário não precisa de login. O responsável faz o cadastro pelo painel; o aparelho pareado reconhece e registra o ponto.</p><button className="secondary registration-link" onClick={() => void navigator.clipboard.writeText(registrationLink).then(() => setCopied(true)).catch(() => setCopied(false))}>{copied ? 'Link copiado' : 'Copiar link de solicitação'}</button><small className="registration-help">Envie esse link ao funcionário para ele solicitar o cadastro. A aprovação continua com o responsável.</small></div><ol>{steps.map((step, index) => <li key={step.title} className={step.ready ? 'done' : ''}><span>{step.ready ? '✓' : index + 1}</span><div><strong>{step.title}</strong><small>{step.ready ? 'Concluído' : step.text}</small></div></li>)}</ol></section>;
+}
 function ReportDownloads({ companyId, from, to, token }: { companyId: string; from: string; to: string; token: string }) {
   const [message, setMessage] = useState(''); const [pending, setPending] = useState<'xlsx' | 'pdf' | null>(null);
   async function download(format: 'xlsx' | 'pdf') {
@@ -209,7 +246,7 @@ function FacialProfileProvisioning({ employees, companyId, token }: { employees:
     } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível provisionar o perfil.'); }
     finally { setPending(false); }
   }
-  return <section className="panel facial-profile"><h2>Perfil facial de teste</h2><p>Depois de cadastrar a amostra no terminal, provisione a versão do perfil aqui. A amostra biométrica continua somente no aparelho; este registro guarda apenas a versão e os modelos aceitos para validação do ponto.</p><form onSubmit={provision} className="inline-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !employeeId}>{pending ? 'Provisionando…' : 'Provisionar para teste'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
+  return <section className="panel facial-profile"><h2>Preparar reconhecimento facial</h2><p>Escolha o funcionário antes de abrir o terminal. Depois, no aparelho, o responsável cadastra a amostra facial. A amostra fica cifrada somente no aparelho; aqui ficam apenas a versão e as regras de validação.</p><form onSubmit={provision} className="inline-form"><label>Funcionário<select required value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}>{employees.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !employeeId}>{pending ? 'Preparando…' : 'Preparar no terminal'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
 }
 function EmployeeLocations({ values, employees, locations, companyId, token, onSaved }: { values: EmployeeLocation[]; employees: Employee[]; locations: Location[]; companyId: string; token: string; onSaved: () => void }) {
   const [employeeId, setEmployeeId] = useState(''); const [locationId, setLocationId] = useState(''); const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
@@ -240,7 +277,17 @@ function EmployeeForm({ companyId, locations, token, onSaved }: { companyId: str
     } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível cadastrar o funcionário.'); }
     finally { setPending(false); }
   }
-  return <section className="panel employee-form"><h2>Novo funcionário</h2><form onSubmit={submit}><label>Matrícula<input required maxLength={40} value={registration} onChange={(event) => setRegistration(event.target.value)} /></label><label>Nome<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><label>Cargo<input maxLength={160} value={jobTitle} onChange={(event) => setJobTitle(event.target.value)} /></label><label>Local principal<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Cadastre um local pela API primeiro</option>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !locationId}>{pending ? 'Salvando…' : 'Cadastrar funcionário'}</button>{message && <p className="form-message">{message}</p>}</form></section>;
+  return <section className="panel employee-form"><h2>Cadastrar funcionário</h2><p>O funcionário não precisa criar senha nem acessar este painel. Cadastre os dados uma vez e depois prepare o reconhecimento facial no terminal.</p><form onSubmit={submit}><label>Matrícula<input required maxLength={40} value={registration} onChange={(event) => setRegistration(event.target.value)} /></label><label>Nome<input required maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><label>Cargo<input maxLength={160} value={jobTitle} onChange={(event) => setJobTitle(event.target.value)} /></label><label>Local principal<select required value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Cadastre um local primeiro</option>{activeLocations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><button disabled={pending || !locationId}>{pending ? 'Salvando…' : 'Cadastrar funcionário'}</button>{message && <p className="form-message">{message}</p>}</form></section>;
+}
+function RegistrationRequests({ values, companyId, token, onSaved }: { values: EmployeeRegistrationRequest[]; companyId: string; token: string; onSaved: () => void }) {
+  const [pending, setPending] = useState<string | null>(null); const [message, setMessage] = useState('');
+  async function review(id: string, status: 'reviewed' | 'declined') {
+    setPending(id); setMessage('');
+    try { await api(`/v1/employee-registration-requests/${id}`, token, { method: 'PATCH', body: JSON.stringify({ company_id: companyId, status }) }); setMessage(status === 'reviewed' ? 'Solicitação analisada. Use os dados acima para cadastrar o funcionário.' : 'Solicitação recusada.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível analisar a solicitação.'); }
+    finally { setPending(null); }
+  }
+  return <section className="panel registration-requests"><h2>Solicitações de cadastro</h2><p>Solicitações enviadas pelo link público. Revise os dados e faça o cadastro definitivo do funcionário acima.</p><div className="table-wrap"><table><thead><tr><th>Nome</th><th>Matrícula</th><th>Contato</th><th>Observação</th><th>Recebida</th><th>Ação</th></tr></thead><tbody>{values.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.registration || '—'}</td><td>{item.contact || '—'}</td><td>{item.note || '—'}</td><td>{dateTime(item.created_at)}</td><td><div className="request-actions"><button className="secondary small-button" disabled={pending === item.id} onClick={() => void review(item.id, 'reviewed')}>{pending === item.id ? 'Salvando…' : 'Analisar'}</button><button className="secondary small-button" disabled={pending === item.id} onClick={() => void review(item.id, 'declined')}>Recusar</button></div></td></tr>)}{!values.length && <Empty colSpan={6} />}</tbody></table></div>{message && <p className="form-message">{message}</p>}</section>;
 }
 function Locations({ values, companyId, token, onSaved }: { values: Location[]; companyId: string; token: string; onSaved: () => void }) {
   const [name, setName] = useState(''); const [message, setMessage] = useState('');

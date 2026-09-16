@@ -50,6 +50,10 @@ export type Terminal = {
   id: string; company_id: string; location_id: string; code: string; name: string; active: boolean; version: number;
   last_heartbeat_at: string | null; last_sync_at: string | null; created_at: string;
 };
+export type EmployeeRegistrationRequest = {
+  id: string; company_id: string; name: string; registration: string | null; contact: string | null; note: string | null;
+  status: 'pending' | 'reviewed' | 'declined'; created_at: string; reviewed_at: string | null;
+};
 
 const baseUrl = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
 

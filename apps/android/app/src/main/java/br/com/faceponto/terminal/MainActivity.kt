@@ -57,6 +57,7 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import java.time.Instant
 import java.util.UUID
+import java.util.Calendar
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -182,12 +183,39 @@ class MainActivity : ComponentActivity() {
         capturing = false
     }
     LaunchedEffect(Unit) { if (!granted) permission.launch(Manifest.permission.CAMERA); TerminalSyncWorker.schedule(context) }
-    Column(Modifier.fillMaxSize().background(Color(0xFFF3F7F4)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        Text("BEM-VINDO", fontSize = 32.sp, fontWeight = FontWeight.Bold, color = Color(0xFF12372A)); Text("Olhe para a câmera", fontSize = 22.sp)
-        Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black, RoundedCornerShape(24.dp)), contentAlignment = Alignment.Center) { if (granted) CameraPreview(engine, { observation = it.observation; embedding = it.embedding; passivePadScore = it.passivePadScore }, Modifier.fillMaxSize()) else Text("Permita o uso da câmera", color = Color.White) }
-        Text(when { engine == null -> "Carregando detector facial..."; requireFaceExit -> "Afaste o rosto para a próxima marcação"; observation?.count == 0 -> "Posicione o rosto diante da câmera"; observation?.count ?: 0 > 1 -> "Mantenha somente uma pessoa na imagem"; localMatch != null && !capturing -> "${localMatch!!.employeeName} identificado"; observation?.usable == true -> "Rosto não cadastrado neste terminal"; else -> "Ajuste a posição e a iluminação" }, fontSize = 20.sp, fontWeight = FontWeight.Medium, color = Color(0xFF12372A), textAlign = TextAlign.Center)
-        if (localMatch != null || movementChallenge.step != br.com.faceponto.terminal.recognition.MovementStep.CENTER) Text(movementChallenge.instruction, fontSize = 15.sp, color = Color(0xFF345B4D), textAlign = TextAlign.Center)
-        if (BuildConfig.DEBUG) Button(onClick = {
+    val employeeName = localMatch?.employeeName?.trim()?.substringBefore(' ') ?: ""
+    val punchAccepted = captureMessage?.startsWith("Ponto registrado.") == true
+    val title = when {
+        punchAccepted && employeeName.isNotBlank() -> "${timeGreeting()}, $employeeName!"
+        requireFaceExit && employeeName.isNotBlank() -> "Obrigado, $employeeName!"
+        employeeName.isNotBlank() -> "Olá, $employeeName"
+        else -> "Registre seu ponto"
+    }
+    val status = captureMessage ?: when {
+        engine == null -> "Preparando a câmera…"
+        requireFaceExit -> "Pode se afastar."
+        observation?.count == 0 -> "Posicione o rosto no centro da câmera"
+        observation?.count ?: 0 > 1 -> "Apenas uma pessoa por vez"
+        localMatch != null && !capturing -> movementChallenge.instruction
+        observation?.usable == true -> "Rosto ainda não cadastrado neste terminal"
+        else -> "Ajuste a posição e a iluminação"
+    }
+    Column(Modifier.fillMaxSize().background(Color(0xFFF3F7F4)).padding(horizontal = 20.dp, vertical = 28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Text("FACEPONTO", fontSize = 14.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp, color = Color(0xFF2B6B55))
+        Text(title, fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color(0xFF12372A), textAlign = TextAlign.Center)
+        Text(if (punchAccepted) "Sua marcação foi registrada." else "Olhe para a câmera para registrar sua jornada.", fontSize = 16.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
+        Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black, RoundedCornerShape(28.dp)), contentAlignment = Alignment.Center) { if (granted) CameraPreview(engine, { observation = it.observation; embedding = it.embedding; passivePadScore = it.passivePadScore }, Modifier.fillMaxSize()) else Text("Permita o uso da câmera", color = Color.White) }
+        Surface(color = if (punchAccepted) Color(0xFFD9F7E5) else Color.White, shape = RoundedCornerShape(18.dp), tonalElevation = 1.dp, modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(status, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF12372A), textAlign = TextAlign.Center)
+                if (!punchAccepted && localMatch != null && movementChallenge.step != MovementStep.CENTER) Text("Siga a orientação sem sair da câmera.", fontSize = 14.sp, color = Color(0xFF48655A), textAlign = TextAlign.Center)
+            }
+        }
+        if (BuildConfig.DEBUG && candidates.isEmpty()) Surface(color = Color(0xFFFFF4D6), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Configuração inicial", fontWeight = FontWeight.Bold, color = Color(0xFF6B4B00))
+                Text("Somente o responsável deve cadastrar a amostra do funcionário neste terminal.", fontSize = 13.sp, color = Color(0xFF6B4B00))
+                Button(onClick = {
             val captured = embedding ?: return@Button
             scope.launch {
                 enrollmentMessage = "Protegendo amostra..."
@@ -200,18 +228,17 @@ class MainActivity : ComponentActivity() {
                 }
                 profileRevision++
             }
-        }, enabled = embedding != null) { Text("CADASTRAR AMOSTRA DE TESTE") }
-        enrollmentMessage?.let { Text(it, fontSize = 12.sp, color = Color(0xFF345B4D)) }
-        captureMessage?.let { Text(it, fontSize = 14.sp, color = Color(0xFF345B4D), textAlign = TextAlign.Center) }
-        Text("Terminal ${credentials.terminalId.take(8)} • Fila: ${pending ?: 0} • Catálogo: ${catalogCount ?: 0}", fontSize = 13.sp)
-        Text(
-            if (BuildConfig.DEBUG) "Teste: desafio ativo + PAD passivo experimental${passivePadScore?.let { " (${String.format(java.util.Locale.US, "%.0f", it * 100)}%)" } ?: " (carregando)"}"
-            else "Ponto bloqueado: nenhum PAD passivo homologado",
-            fontSize = 12.sp,
-            color = Color(0xFF61766E),
-        )
-        Text(if (clockVerified == true) "Relógio verificado" else "Relógio aguardando verificação", fontSize = 12.sp, color = Color(0xFF345B4D))
+                }, enabled = embedding != null) { Text("Cadastrar amostra") }
+                enrollmentMessage?.let { Text(it, fontSize = 12.sp, color = Color(0xFF6B4B00)) }
+            }
+        }
     }
+}
+
+private fun timeGreeting(hour: Int = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)): String = when (hour) {
+    in 5..11 -> "Bom dia"
+    in 12..17 -> "Boa tarde"
+    else -> "Boa noite"
 }
 
 private suspend fun persistFacePunch(context: android.content.Context, employeeId: String, pad: PadDecision.Passed) {

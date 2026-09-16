@@ -107,6 +107,14 @@ const employeeSchedulePlanBody = z.object({
 const employeeSchedulePlanParams = z.object({ id: z.uuid() }).strict();
 const clearEmployeeSchedulePlanBody = z.object({ company_id: z.uuid(), expected_version: z.number().int().positive() }).strict();
 const facialProfileBody = z.object({ company_id: z.uuid(), employee_id: z.uuid() }).strict();
+const publicRegistrationParams = z.object({ id: z.uuid() }).strict();
+const publicRegistrationBody = z.object({
+  company_id: z.uuid(), name: z.string().trim().min(1).max(160), registration: z.string().trim().max(40).optional(),
+  contact: z.string().trim().max(160).optional(), note: z.string().trim().max(500).optional(),
+}).strict();
+const registrationRequestsQuery = z.object({ company_id: z.uuid(), status: z.enum(['pending', 'reviewed', 'declined']).optional() }).strict();
+const registrationRequestParams = z.object({ id: z.uuid() }).strict();
+const registrationRequestReviewBody = z.object({ company_id: z.uuid(), status: z.enum(['reviewed', 'declined']) }).strict();
 
 function error(reply: FastifyReply, status: number, code: string, message: string, requestId: string) {
   return reply.code(status).send({ code, message, request_id: requestId });
@@ -156,9 +164,31 @@ export function buildApp(config: ApiConfig) {
   });
   app.get('/health', async () => ({ status: 'ok' }));
   app.addHook('preHandler', async (request, reply) => {
-    if (request.url === '/health' || request.url === '/v1/terminal/pair' || request.url === '/v1/terminal/refresh') return;
+    if (request.url === '/health' || request.url === '/v1/terminal/pair' || request.url === '/v1/terminal/refresh' || request.url.startsWith('/v1/public-registration/')) return;
     request.auth = await authenticate(config, request.headers.authorization);
     if (!request.auth) return error(reply, 401, 'UNAUTHORIZED', 'Autenticação necessária.', request.id);
+  });
+  app.get('/v1/public-registration/companies/:id', async (request, reply) => {
+    const params = publicRegistrationParams.parse(request.params);
+    if (!config.SUPABASE_SECRET_KEY) return error(reply, 503, 'REGISTRATION_UNAVAILABLE', 'Solicitação indisponível no momento.', request.id);
+    const admin = createClient(config.SUPABASE_URL, config.SUPABASE_SECRET_KEY, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
+    const { data, error: dbError } = await admin.from('companies').select('id,name').eq('id', params.id).eq('active', true).maybeSingle();
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    if (!data) return error(reply, 404, 'NOT_FOUND', 'Empresa não encontrada.', request.id);
+    return data;
+  });
+  app.post('/v1/public-registration/requests', async (request, reply) => {
+    const body = publicRegistrationBody.parse(request.body);
+    if (!config.SUPABASE_SECRET_KEY) return error(reply, 503, 'REGISTRATION_UNAVAILABLE', 'Solicitação indisponível no momento.', request.id);
+    const admin = createClient(config.SUPABASE_URL, config.SUPABASE_SECRET_KEY, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
+    const { data: company, error: companyError } = await admin.from('companies').select('id').eq('id', body.company_id).eq('active', true).maybeSingle();
+    if (companyError) return mapDatabaseError(reply, request, companyError);
+    if (!company) return error(reply, 404, 'NOT_FOUND', 'Empresa não encontrada.', request.id);
+    const { error: dbError } = await admin.from('employee_registration_requests').insert({
+      ...body, registration: body.registration || null, contact: body.contact || null, note: body.note || null,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send({ message: 'Solicitação enviada para análise.' });
   });
   app.get('/v1/me', async (request, reply) => {
     const auth = request.auth!;
@@ -166,6 +196,25 @@ export function buildApp(config: ApiConfig) {
       .select('company_id,role,active,companies(id,name,timezone,active)').eq('user_id', auth.user.id).eq('active', true);
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return { user: { id: auth.user.id, email: auth.user.email ?? null }, memberships: data };
+  });
+  app.get('/v1/employee-registration-requests', async (request, reply) => {
+    const query = registrationRequestsQuery.parse(request.query);
+    let builder = request.auth!.db.from('employee_registration_requests')
+      .select('id,company_id,name,registration,contact,note,status,created_at,reviewed_at').eq('company_id', query.company_id)
+      .order('created_at', { ascending: false }).limit(100);
+    if (query.status) builder = builder.eq('status', query.status);
+    const { data, error: dbError } = await builder;
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
+  app.patch('/v1/employee-registration-requests/:id', async (request, reply) => {
+    const params = registrationRequestParams.parse(request.params); const body = registrationRequestReviewBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.from('employee_registration_requests').update({
+      status: body.status, reviewed_at: new Date().toISOString(), reviewed_by: request.auth!.user.id,
+    }).eq('id', params.id).eq('company_id', body.company_id).eq('status', 'pending').select('id,status').maybeSingle();
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    if (!data) return error(reply, 409, 'VERSION_CONFLICT', 'A solicitação já foi analisada ou não está disponível.', request.id);
+    return data;
   });
   app.post('/v1/companies', async (request, reply) => {
     const body = companyBody.parse(request.body);
