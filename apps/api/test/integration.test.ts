@@ -85,7 +85,9 @@ after(async () => {
       'private.terminal_pairings', 'public.terminal_status', 'public.employee_schedule_plans', 'public.schedule_assignments',
       'public.schedule_segments', 'public.schedule_weekdays', 'public.schedule_versions',
       'public.work_schedules', 'public.terminal_location_assignments', 'public.employee_locations',
-      'private.employee_documents', 'public.day_justifications', 'public.employees', 'public.departments',
+      'private.employee_documents', 'public.day_justifications', 'public.employee_payment_days',
+      'public.employee_payment_settings', 'public.department_payment_settings', 'public.company_payment_settings',
+      'private.employee_registration_counters', 'public.employees', 'public.departments',
       'public.absence_categories', 'public.member_locations',
       'public.terminals', 'public.locations', 'public.company_memberships',
     ]) await sql.query(`delete from ${table} where company_id = any($1)`, [companies]);
@@ -141,6 +143,140 @@ test('employee API obeys RLS and does not disclose another tenant', async () => 
   });
   assert.equal(forbidden.statusCode, 403, forbidden.body);
   assert.equal(forbidden.json().code, 'FORBIDDEN');
+});
+
+test('employee creation assigns consecutive numeric registrations on the server', async () => {
+  const [first, second] = await Promise.all([
+    request('POST', '/v1/employees', tokenA, {
+      company_id: companyA, name: 'Cadastro automático um', home_location_id: locationA,
+    }),
+    request('POST', '/v1/employees', tokenA, {
+      company_id: companyA, name: 'Cadastro automático dois', home_location_id: locationA,
+    }),
+  ]);
+  assert.equal(first.statusCode, 201, first.body);
+  assert.equal(second.statusCode, 201, second.body);
+  const registrations = [Number(first.json().registration), Number(second.json().registration)].sort((a, b) => a - b);
+  assert.deepEqual(registrations, [1, 2]);
+
+  const supplied = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: '25', name: 'Matrícula manual', home_location_id: locationA,
+  });
+  assert.equal(supplied.statusCode, 201, supplied.body);
+  const afterManual = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, name: 'Após matrícula manual', home_location_id: locationA,
+  });
+  assert.equal(afterManual.statusCode, 201, afterManual.body);
+  assert.equal(afterManual.json().registration, '26');
+
+  const legacy = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: 'LEGADO-A', name: 'Matrícula legada', home_location_id: locationA,
+  });
+  assert.equal(legacy.statusCode, 201, legacy.body);
+  const afterLegacy = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, name: 'Após matrícula legada', home_location_id: locationA,
+  });
+  assert.equal(afterLegacy.statusCode, 201, afterLegacy.body);
+  assert.equal(afterLegacy.json().registration, '27');
+  const corrected = await request('PATCH', `/v1/employees/${afterLegacy.json().id}`, tokenA, {
+    company_id: companyA, expected_version: afterLegacy.json().version, registration: '40',
+  });
+  assert.equal(corrected.statusCode, 200, corrected.body);
+  const afterCorrection = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, name: 'Após correção manual', home_location_id: locationA,
+  });
+  assert.equal(afterCorrection.statusCode, 201, afterCorrection.body);
+  assert.equal(afterCorrection.json().registration, '41');
+
+  const foreign = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyB, name: 'Tentativa automática cruzada', home_location_id: locationB,
+  });
+  assert.equal(foreign.statusCode, 403, foreign.body);
+});
+
+test('cargo rates inherit every missing field from employee to cargo then company', async () => {
+  const cargos = await request('GET', `/v1/departments?company_id=${companyA}`, tokenA);
+  assert.equal(cargos.statusCode, 200, cargos.body);
+  assert.deepEqual(cargos.json().data.map((item: { name: string }) => item.name), ['Administrativo', 'Chapa']);
+  const administrativo = cargos.json().data.find((item: { name: string }) => item.name === 'Administrativo');
+  assert.ok(administrativo);
+  const createdCargo = await request('POST', '/v1/departments', tokenA, {
+    company_id: companyA, name: 'Motorista',
+  });
+  assert.equal(createdCargo.statusCode, 201, createdCargo.body);
+  const renamedCargo = await request('PATCH', `/v1/departments/${createdCargo.json().id}`, tokenA, {
+    company_id: companyA, expected_version: createdCargo.json().version, name: 'Motorista de apoio',
+  });
+  assert.equal(renamedCargo.statusCode, 200, renamedCargo.body);
+  assert.equal(renamedCargo.json().version, createdCargo.json().version + 1);
+
+  const employee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, name: 'Pessoa com cargo', department_id: administrativo.id, home_location_id: locationA,
+  });
+  assert.equal(employee.statusCode, 201, employee.body);
+
+  const companyRates = await request('POST', '/v1/company-payment-settings', tokenA, {
+    company_id: companyA, regular_hour_cents: 1100, overtime_hour_cents: 1500, meal_cents: 1000,
+    dinner_cents: 1200, daily_allowance_cents: 5000, night_shift_cents: 2000, saturday_cents: 2200,
+    serao_cents: 3000,
+  });
+  assert.equal(companyRates.statusCode, 201, companyRates.body);
+
+  const cargoRates = await request('POST', '/v1/department-payment-settings', tokenA, {
+    company_id: companyA, department_id: administrativo.id, regular_hour_cents: null, overtime_hour_cents: 1800,
+    meal_cents: 1500, dinner_cents: null, daily_allowance_cents: null, night_shift_cents: 2500,
+    saturday_cents: null, serao_cents: 3500,
+  });
+  assert.equal(cargoRates.statusCode, 201, cargoRates.body);
+
+  const employeeRates = await request('POST', '/v1/payment-settings', tokenA, {
+    company_id: companyA, employee_id: employee.json().id, regular_hour_cents: 1250, overtime_hour_cents: null,
+    meal_cents: null, dinner_cents: 1400, daily_allowance_cents: null, night_shift_cents: null,
+    saturday_cents: null, serao_cents: null,
+  });
+  assert.equal(employeeRates.statusCode, 201, employeeRates.body);
+
+  const resolved = await request('GET', `/v1/payment-rates?company_id=${companyA}&employee_id=${employee.json().id}`, tokenA);
+  assert.equal(resolved.statusCode, 200, resolved.body);
+  assert.deepEqual(resolved.json().data, {
+    regular_hour_cents: { cents: 1250, source: 'employee' },
+    overtime_hour_cents: { cents: 1800, source: 'department' },
+    meal_cents: { cents: 1500, source: 'department' },
+    dinner_cents: { cents: 1400, source: 'employee' },
+    daily_allowance_cents: { cents: 5000, source: 'company' },
+    night_shift_cents: { cents: 2500, source: 'department' },
+    saturday_cents: { cents: 2200, source: 'company' },
+    serao_cents: { cents: 3500, source: 'department' },
+  });
+
+  const savedDay = await request('POST', '/v1/payment-days', tokenA, {
+    company_id: companyA, employee_id: employee.json().id, local_date: '2026-10-01',
+    meal_units: 0, dinner_units: 1, daily_allowance_units: 0, night_shift_units: 0, saturday_units: 0, serao_units: 1,
+  });
+  assert.equal(savedDay.statusCode, 201, savedDay.body);
+  assert.equal(savedDay.json().serao_units, 1);
+
+  const disabled = await request('PATCH', `/v1/departments/${administrativo.id}`, tokenA, {
+    company_id: companyA, expected_version: administrativo.version, active: false,
+  });
+  assert.equal(disabled.statusCode, 200, disabled.body);
+  assert.equal(disabled.json().active, false);
+  const remaining = await request('GET', `/v1/employees?company_id=${companyA}`, tokenA);
+  assert.equal(remaining.json().data.some((item: { id: string; department_id: string }) => item.id === employee.json().id && item.department_id === administrativo.id), true);
+  const afterDisabling = await request('GET', `/v1/payment-rates?company_id=${companyA}&employee_id=${employee.json().id}`, tokenA);
+  assert.equal(afterDisabling.statusCode, 200, afterDisabling.body);
+  assert.deepEqual(afterDisabling.json().data.night_shift_cents, { cents: 2500, source: 'department' });
+  const withoutCargo = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, name: 'Sem cargo ativo', home_location_id: locationA,
+  });
+  assert.equal(withoutCargo.statusCode, 201, withoutCargo.body);
+  const rejectedAssignment = await request('PATCH', `/v1/employees/${withoutCargo.json().id}`, tokenA, {
+    company_id: companyA, expected_version: withoutCargo.json().version, department_id: administrativo.id,
+  });
+  assert.equal(rejectedAssignment.statusCode, 422, rejectedAssignment.body);
+
+  const foreign = await request('GET', `/v1/payment-rates?company_id=${companyA}&employee_id=${employee.json().id}`, tokenB);
+  assert.equal(foreign.statusCode, 403, foreign.body);
 });
 
 test('employee updates are versioned, auditable and never overwrite stale data', async () => {
@@ -355,7 +491,7 @@ test('one-time pairing gives the tablet its own identity, heartbeat and scoped c
   const catalog = await request('GET', '/v1/terminal/catalog', terminalToken);
   assert.equal(catalog.statusCode, 200, catalog.body);
   assert.equal(catalog.json().location_id, locationA);
-  assert.deepEqual(catalog.json().employees.map((employee: { name: string }) => employee.name), ['Pessoa de Teste Atualizada']);
+  assert.equal(catalog.json().employees.some((employee: { id: string; name: string }) => employee.id === employeeId && employee.name === 'Pessoa de Teste Atualizada'), true);
   const status = await sql.query('select pending_count,app_version from public.terminal_status where terminal_id=$1', [terminalId]);
   assert.deepEqual(status.rows[0], { pending_count: 3, app_version: '0.1.0' });
   assert.equal((await sql.query('select version from public.terminals where id=$1', [terminalId])).rows[0].version, 2);
@@ -376,8 +512,10 @@ test('manager provisions versioned facial profile metadata without exposing biom
   assert.ok(recognitionPolicyVersion >= 1);
   const catalog = await request('GET', '/v1/terminal/catalog', terminalToken);
   assert.equal(catalog.statusCode, 200, catalog.body);
-  assert.deepEqual(catalog.json().employees[0].profile_id, facialProfileId);
-  assert.equal(catalog.json().employees[0].profile_version, 1);
+  const profiled = catalog.json().employees.find((employee: { id: string }) => employee.id === employeeId);
+  assert.ok(profiled);
+  assert.deepEqual(profiled.profile_id, facialProfileId);
+  assert.equal(profiled.profile_version, 1);
   const stored = await sql.query('select count(*)::int as count from private.facial_profiles where id=$1', [facialProfileId]);
   assert.equal(stored.rows[0].count, 1);
 });

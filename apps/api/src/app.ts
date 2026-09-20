@@ -27,7 +27,7 @@ const employeeLocationBody = z.object({
   valid_to: z.iso.datetime({ offset: true }).nullable().optional(),
 }).strict().refine((value) => value.valid_to == null || new Date(value.valid_to) > new Date(value.valid_from));
 const employeeBody = z.object({
-  company_id: z.uuid(), registration: z.string().trim().min(1).max(40), name: z.string().trim().min(1).max(160),
+  company_id: z.uuid(), registration: z.string().trim().min(1).max(40).optional(), name: z.string().trim().min(1).max(160),
   job_title: z.string().trim().max(160).default(''), department_id: z.uuid().nullable().optional(), home_location_id: z.uuid(),
 }).strict();
 const employeeParams = z.object({ id: z.uuid() }).strict();
@@ -45,6 +45,12 @@ const locationBody = z.object({ company_id: z.uuid(), name: z.string().trim().mi
 const locationParams = z.object({ id: z.uuid() }).strict();
 const scopedUpdateBody = z.object({ company_id: z.uuid(), expected_version: z.number().int().positive(), name: z.string().trim().min(1).max(160).optional(), active: z.boolean().optional() }).strict()
   .refine((value) => value.name !== undefined || value.active !== undefined);
+const departmentsQuery = z.object({ company_id: z.uuid(), active: z.stringbool().optional() }).strict();
+const departmentBody = z.object({ company_id: z.uuid(), name: z.string().trim().min(1).max(120) }).strict();
+const departmentParams = z.object({ id: z.uuid() }).strict();
+const departmentUpdateBody = z.object({
+  company_id: z.uuid(), expected_version: z.number().int().positive(), name: z.string().trim().min(1).max(120).optional(), active: z.boolean().optional(),
+}).strict().refine((value) => value.name !== undefined || value.active !== undefined);
 const terminalBody = z.object({
   company_id: z.uuid(), location_id: z.uuid(), code: z.string().trim().min(1).max(40), name: z.string().trim().min(1).max(160),
 }).strict();
@@ -124,27 +130,36 @@ const employeeSchedulePlanBody = z.object({
 const employeeSchedulePlanParams = z.object({ id: z.uuid() }).strict();
 const clearEmployeeSchedulePlanBody = z.object({ company_id: z.uuid(), expected_version: z.number().int().positive() }).strict();
 const facialProfileBody = z.object({ company_id: z.uuid(), employee_id: z.uuid() }).strict();
+const paymentRate = z.number().int().min(0).max(10000000);
+const nullablePaymentRate = paymentRate.nullable().optional().default(null);
 const companyPaymentSettingsBody = z.object({
   company_id: z.uuid(), expected_version: z.number().int().positive().nullable().optional(),
-  regular_hour_cents: z.number().int().min(0).max(10000000), overtime_hour_cents: z.number().int().min(0).max(10000000),
-  meal_cents: z.number().int().min(0).max(10000000), dinner_cents: z.number().int().min(0).max(10000000),
-  daily_allowance_cents: z.number().int().min(0).max(10000000), night_shift_cents: z.number().int().min(0).max(10000000),
-  saturday_cents: z.number().int().min(0).max(10000000),
+  regular_hour_cents: paymentRate, overtime_hour_cents: paymentRate, serao_cents: paymentRate.default(0),
+  meal_cents: paymentRate, dinner_cents: paymentRate, daily_allowance_cents: paymentRate,
+  night_shift_cents: paymentRate, saturday_cents: paymentRate,
 }).strict();
 const paymentSettingsQuery = z.object({ company_id: z.uuid(), employee_id: z.uuid() }).strict();
 const paymentSettingsBody = z.object({
   company_id: z.uuid(), employee_id: z.uuid(), expected_version: z.number().int().positive().nullable().optional(),
-  regular_hour_cents: z.number().int().min(0).max(10000000), overtime_hour_cents: z.number().int().min(0).max(10000000),
-  meal_cents: z.number().int().min(0).max(10000000), dinner_cents: z.number().int().min(0).max(10000000),
-  daily_allowance_cents: z.number().int().min(0).max(10000000), night_shift_cents: z.number().int().min(0).max(10000000),
-  saturday_cents: z.number().int().min(0).max(10000000),
+  regular_hour_cents: nullablePaymentRate, overtime_hour_cents: nullablePaymentRate, serao_cents: nullablePaymentRate,
+  meal_cents: nullablePaymentRate, dinner_cents: nullablePaymentRate, daily_allowance_cents: nullablePaymentRate,
+  night_shift_cents: nullablePaymentRate, saturday_cents: nullablePaymentRate,
 }).strict();
+const departmentPaymentSettingsQuery = z.object({ company_id: z.uuid(), department_id: z.uuid() }).strict();
+const departmentPaymentSettingsBody = z.object({
+  company_id: z.uuid(), department_id: z.uuid(), expected_version: z.number().int().positive().nullable().optional(),
+  regular_hour_cents: nullablePaymentRate, overtime_hour_cents: nullablePaymentRate, serao_cents: nullablePaymentRate,
+  meal_cents: nullablePaymentRate, dinner_cents: nullablePaymentRate, daily_allowance_cents: nullablePaymentRate,
+  night_shift_cents: nullablePaymentRate, saturday_cents: nullablePaymentRate,
+}).strict();
+const paymentRatesQuery = z.object({ company_id: z.uuid(), employee_id: z.uuid() }).strict();
 const paymentDaysQuery = z.object({ company_id: z.uuid(), employee_id: z.uuid(), date_from: z.iso.date().optional(), date_to: z.iso.date().optional() }).strict()
   .refine((value) => !value.date_from || !value.date_to || value.date_to >= value.date_from);
 const paymentDayBody = z.object({
   company_id: z.uuid(), employee_id: z.uuid(), local_date: z.iso.date(), expected_version: z.number().int().positive().nullable().optional(),
   meal_units: z.number().int().min(0).max(10), dinner_units: z.number().int().min(0).max(10), daily_allowance_units: z.number().int().min(0).max(10),
   night_shift_units: z.number().int().min(0).max(10), saturday_units: z.number().int().min(0).max(10),
+  serao_units: z.number().int().min(0).max(10).optional().default(0),
 }).strict();
 const publicRegistrationParams = z.object({ id: z.uuid() }).strict();
 const publicRegistrationBody = z.object({
@@ -286,8 +301,14 @@ export function buildApp(config: ApiConfig) {
   });
   app.post('/v1/employees', async (request, reply) => {
     const body = employeeBody.parse(request.body);
-    const { data, error: dbError } = await request.auth!.db.from('employees').insert(body)
-      .select('id,company_id,registration,name,job_title,department_id,home_location_id,active,version,created_at').single();
+    const { data, error: dbError } = await request.auth!.db.rpc('create_employee_with_registration', {
+      p_company: body.company_id,
+      p_registration: body.registration ?? null,
+      p_name: body.name,
+      p_job_title: body.job_title,
+      p_department: body.department_id ?? null,
+      p_home_location: body.home_location_id,
+    });
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return reply.code(201).send(data);
   });
@@ -300,6 +321,39 @@ export function buildApp(config: ApiConfig) {
       .select('id,company_id,registration,name,job_title,department_id,home_location_id,active,version,created_at').maybeSingle();
     if (dbError) return mapDatabaseError(reply, request, dbError);
     if (!data) return error(reply, 409, 'VERSION_CONFLICT', 'O registro foi alterado ou não está disponível.', request.id);
+    return data;
+  });
+  app.get('/v1/departments', async (request, reply) => {
+    const query = departmentsQuery.parse(request.query);
+    let builder = request.auth!.db.from('departments')
+      .select('id,company_id,name,active,version,created_at,updated_at')
+      .eq('company_id', query.company_id)
+      .order('name')
+      .limit(200);
+    if (query.active !== undefined) builder = builder.eq('active', query.active);
+    const { data, error: dbError } = await builder;
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
+  app.post('/v1/departments', async (request, reply) => {
+    const body = departmentBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('create_department', {
+      p_company: body.company_id, p_name: body.name,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
+  });
+  app.patch('/v1/departments/:id', async (request, reply) => {
+    const params = departmentParams.parse(request.params);
+    const body = departmentUpdateBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('update_department', {
+      p_company: body.company_id,
+      p_department: params.id,
+      p_expected_version: body.expected_version,
+      p_name: body.name ?? null,
+      p_active: body.active ?? null,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
     return data;
   });
   app.post('/v1/facial-profiles', async (request, reply) => {
@@ -319,7 +373,7 @@ export function buildApp(config: ApiConfig) {
   app.get('/v1/company-payment-settings', async (request, reply) => {
     const query = tenantQuery.parse(request.query);
     const { data, error: dbError } = await request.auth!.db.from('company_payment_settings')
-      .select('id,company_id,regular_hour_cents,overtime_hour_cents,meal_cents,dinner_cents,daily_allowance_cents,night_shift_cents,saturday_cents,version')
+      .select('id,company_id,regular_hour_cents,overtime_hour_cents,serao_cents,meal_cents,dinner_cents,daily_allowance_cents,night_shift_cents,saturday_cents,version')
       .eq('company_id', query.company_id).maybeSingle();
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return { data };
@@ -328,7 +382,7 @@ export function buildApp(config: ApiConfig) {
     const body = companyPaymentSettingsBody.parse(request.body);
     const { data, error: dbError } = await request.auth!.db.rpc('save_company_payment_settings', {
       p_company: body.company_id, p_regular_hour_cents: body.regular_hour_cents, p_overtime_hour_cents: body.overtime_hour_cents,
-      p_meal_cents: body.meal_cents, p_dinner_cents: body.dinner_cents, p_daily_allowance_cents: body.daily_allowance_cents,
+      p_serao_cents: body.serao_cents, p_meal_cents: body.meal_cents, p_dinner_cents: body.dinner_cents, p_daily_allowance_cents: body.daily_allowance_cents,
       p_night_shift_cents: body.night_shift_cents, p_saturday_cents: body.saturday_cents, p_expected_version: body.expected_version ?? null,
     });
     if (dbError) return mapDatabaseError(reply, request, dbError);
@@ -337,7 +391,7 @@ export function buildApp(config: ApiConfig) {
   app.get('/v1/payment-settings', async (request, reply) => {
     const query = paymentSettingsQuery.parse(request.query);
     const { data, error: dbError } = await request.auth!.db.from('employee_payment_settings')
-      .select('id,company_id,employee_id,regular_hour_cents,overtime_hour_cents,meal_cents,dinner_cents,daily_allowance_cents,night_shift_cents,saturday_cents,version')
+      .select('id,company_id,employee_id,regular_hour_cents,overtime_hour_cents,serao_cents,meal_cents,dinner_cents,daily_allowance_cents,night_shift_cents,saturday_cents,version')
       .eq('company_id', query.company_id).eq('employee_id', query.employee_id).maybeSingle();
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return { data };
@@ -346,17 +400,51 @@ export function buildApp(config: ApiConfig) {
     const body = paymentSettingsBody.parse(request.body);
     const { data, error: dbError } = await request.auth!.db.rpc('save_employee_payment_settings', {
       p_company: body.company_id, p_employee: body.employee_id, p_regular_hour_cents: body.regular_hour_cents,
-      p_overtime_hour_cents: body.overtime_hour_cents, p_meal_cents: body.meal_cents, p_dinner_cents: body.dinner_cents,
+      p_overtime_hour_cents: body.overtime_hour_cents, p_serao_cents: body.serao_cents, p_meal_cents: body.meal_cents, p_dinner_cents: body.dinner_cents,
       p_daily_allowance_cents: body.daily_allowance_cents, p_night_shift_cents: body.night_shift_cents,
       p_saturday_cents: body.saturday_cents, p_expected_version: body.expected_version ?? null,
     });
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return reply.code(201).send(data);
   });
+  app.get('/v1/department-payment-settings', async (request, reply) => {
+    const query = departmentPaymentSettingsQuery.parse(request.query);
+    const { data, error: dbError } = await request.auth!.db.from('department_payment_settings')
+      .select('id,company_id,department_id,regular_hour_cents,overtime_hour_cents,serao_cents,meal_cents,dinner_cents,daily_allowance_cents,night_shift_cents,saturday_cents,version')
+      .eq('company_id', query.company_id).eq('department_id', query.department_id).maybeSingle();
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
+  app.post('/v1/department-payment-settings', async (request, reply) => {
+    const body = departmentPaymentSettingsBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('save_department_payment_settings', {
+      p_company: body.company_id,
+      p_department: body.department_id,
+      p_regular_hour_cents: body.regular_hour_cents,
+      p_overtime_hour_cents: body.overtime_hour_cents,
+      p_serao_cents: body.serao_cents,
+      p_meal_cents: body.meal_cents,
+      p_dinner_cents: body.dinner_cents,
+      p_daily_allowance_cents: body.daily_allowance_cents,
+      p_night_shift_cents: body.night_shift_cents,
+      p_saturday_cents: body.saturday_cents,
+      p_expected_version: body.expected_version ?? null,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
+  });
+  app.get('/v1/payment-rates', async (request, reply) => {
+    const query = paymentRatesQuery.parse(request.query);
+    const { data, error: dbError } = await request.auth!.db.rpc('resolve_employee_payment_rates', {
+      p_company: query.company_id, p_employee: query.employee_id,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
   app.get('/v1/payment-days', async (request, reply) => {
     const query = paymentDaysQuery.parse(request.query);
     let builder = request.auth!.db.from('employee_payment_days')
-      .select('id,company_id,employee_id,local_date,meal_units,dinner_units,daily_allowance_units,night_shift_units,saturday_units,version')
+      .select('id,company_id,employee_id,local_date,meal_units,dinner_units,daily_allowance_units,night_shift_units,saturday_units,serao_units,version')
       .eq('company_id', query.company_id).eq('employee_id', query.employee_id).order('local_date');
     if (query.date_from) builder = builder.gte('local_date', query.date_from);
     if (query.date_to) builder = builder.lte('local_date', query.date_to);
@@ -369,7 +457,8 @@ export function buildApp(config: ApiConfig) {
     const { data, error: dbError } = await request.auth!.db.rpc('save_employee_payment_day', {
       p_company: body.company_id, p_employee: body.employee_id, p_local_date: body.local_date,
       p_meal_units: body.meal_units, p_dinner_units: body.dinner_units, p_daily_allowance_units: body.daily_allowance_units,
-      p_night_shift_units: body.night_shift_units, p_saturday_units: body.saturday_units, p_expected_version: body.expected_version ?? null,
+      p_night_shift_units: body.night_shift_units, p_saturday_units: body.saturday_units, p_serao_units: body.serao_units,
+      p_expected_version: body.expected_version ?? null,
     });
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return reply.code(201).send(data);

@@ -12,16 +12,30 @@ export type Punch = {
 export type FacialProfileStatus = { employee_id: string; profile_version: number; prepared_at: string };
 export type CompanyPaymentSettings = {
   id: string; company_id: string; regular_hour_cents: number; overtime_hour_cents: number; meal_cents: number;
-  dinner_cents: number; daily_allowance_cents: number; night_shift_cents: number; saturday_cents: number; version: number;
+  dinner_cents: number; daily_allowance_cents: number; night_shift_cents: number; saturday_cents: number; serao_cents: number; version: number;
 };
 export type EmployeePaymentSettings = {
-  id: string; company_id: string; employee_id: string; regular_hour_cents: number; overtime_hour_cents: number;
-  meal_cents: number; dinner_cents: number; daily_allowance_cents: number; night_shift_cents: number; saturday_cents: number; version: number;
+  id: string; company_id: string; employee_id: string; regular_hour_cents: number | null; overtime_hour_cents: number | null;
+  serao_cents: number | null; meal_cents: number | null; dinner_cents: number | null; daily_allowance_cents: number | null;
+  night_shift_cents: number | null; saturday_cents: number | null; version: number;
+};
+export type Department = {
+  id: string; company_id: string; name: string; active: boolean; version: number; created_at: string; updated_at: string;
+};
+export type DepartmentPaymentSettings = {
+  id: string; company_id: string; department_id: string; regular_hour_cents: number | null; overtime_hour_cents: number | null;
+  serao_cents: number | null; meal_cents: number | null; dinner_cents: number | null; daily_allowance_cents: number | null;
+  night_shift_cents: number | null; saturday_cents: number | null; version: number;
 };
 export type EmployeePaymentDay = {
   id: string; company_id: string; employee_id: string; local_date: string; meal_units: number; dinner_units: number;
-  daily_allowance_units: number; night_shift_units: number; saturday_units: number; version: number;
+  daily_allowance_units: number; night_shift_units: number; saturday_units: number; serao_units: number; version: number;
 };
+export type PaymentRateKey =
+  | 'regular_hour_cents' | 'overtime_hour_cents' | 'serao_cents' | 'meal_cents'
+  | 'dinner_cents' | 'daily_allowance_cents' | 'night_shift_cents' | 'saturday_cents';
+export type ResolvedPaymentRate = { cents: number; source: 'employee' | 'department' | 'company' | 'none' };
+export type ResolvedPaymentRates = Record<PaymentRateKey, ResolvedPaymentRate>;
 export type WorkDay = {
   id: string; employee_id: string; local_date: string; timezone: string;
   attendance_calculations: Array<{
@@ -39,7 +53,7 @@ export type PunchAdjustment = {
   id: string; employee_id: string; original_time_punch_id: string; corrected_timestamp: string; reason: string; created_at: string;
 };
 export type Employee = {
-  id: string; registration: string; name: string; job_title: string; home_location_id: string; active: boolean; version: number;
+  id: string; registration: string; name: string; job_title: string; department_id: string | null; home_location_id: string; active: boolean; version: number;
 };
 export type Location = { id: string; name: string; active: boolean; version: number };
 export type EmployeeLocation = { id: string; employee_id: string; location_id: string; valid_from: string; valid_to: string | null };
