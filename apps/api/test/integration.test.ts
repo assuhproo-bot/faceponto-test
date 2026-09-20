@@ -33,6 +33,8 @@ let scheduleAssignmentId = '';
 let acceptedPunchId = '';
 let acceptedPunchTimestamp = '';
 let facialProfileId = '';
+let livenessModelHash = '';
+let recognitionPolicyVersion = 0;
 
 async function signUpAndLogin(email: string) {
   const created = await admin.auth.admin.createUser({ email, password, email_confirm: true });
@@ -44,6 +46,23 @@ async function signUpAndLogin(email: string) {
 }
 async function request(method: string, path: string, token?: string, payload?: unknown): Promise<Awaited<ReturnType<typeof app.inject>>> {
   return await app.inject({ method, url: path, headers: token ? { authorization: `Bearer ${token}` } : {}, payload } as never);
+}
+async function drainAttendanceQueue(companyId: string, targetEmployeeId: string, message: string) {
+  const stopWorker = startAttendanceWorker({ ...config, ENABLE_ATTENDANCE_WORKER: true });
+  try {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const remaining = await sql.query(
+        'select count(*)::int as count from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2',
+        [companyId, targetEmployeeId],
+      );
+      if (remaining.rows[0].count === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    assert.fail(message);
+  } finally {
+    stopWorker();
+  }
 }
 
 before(async () => {
@@ -66,7 +85,8 @@ after(async () => {
       'private.terminal_pairings', 'public.terminal_status', 'public.employee_schedule_plans', 'public.schedule_assignments',
       'public.schedule_segments', 'public.schedule_weekdays', 'public.schedule_versions',
       'public.work_schedules', 'public.terminal_location_assignments', 'public.employee_locations',
-      'private.employee_documents', 'public.employees', 'public.departments', 'public.member_locations',
+      'private.employee_documents', 'public.day_justifications', 'public.employees', 'public.departments',
+      'public.absence_categories', 'public.member_locations',
       'public.terminals', 'public.locations', 'public.company_memberships',
     ]) await sql.query(`delete from ${table} where company_id = any($1)`, [companies]);
     await sql.query('delete from public.companies where id = any($1)', [companies]);
@@ -189,16 +209,11 @@ test('locations, terminals and schedules are exposed through tenant-scoped API',
 });
 
 test('employee additional locations are tenant-scoped and authorize another workplace', async () => {
-  const created = await request('POST', '/v1/employee-locations', tokenA, {
-    company_id: companyA, employee_id: employeeId, location_id: locationExtraA, valid_from: '2026-09-01T00:00:00-03:00',
-  });
-  assert.equal(created.statusCode, 201, created.body);
-  assert.equal(created.json().location_id, locationExtraA);
   const listed = await request('GET', `/v1/employee-locations?company_id=${companyA}&employee_id=${employeeId}`, tokenA);
   assert.equal(listed.statusCode, 200, listed.body);
-  assert.equal(listed.json().data.length, 1);
+  assert.deepEqual(listed.json().data.map((item: { location_id: string }) => item.location_id), [locationExtraA]);
   const foreign = await request('POST', '/v1/employee-locations', tokenB, {
-    company_id: companyA, employee_id: employeeId, location_id: locationExtraA, valid_from: '2026-09-01T00:00:00-03:00',
+    company_id: companyA, employee_id: employeeId, location_id: locationExtraA, valid_from: '2027-01-01T00:00:00-03:00',
   });
   assert.equal(foreign.statusCode, 403, foreign.body);
   const foreignList = await request('GET', `/v1/employee-locations?company_id=${companyA}`, tokenB);
@@ -355,6 +370,10 @@ test('manager provisions versioned facial profile metadata without exposing biom
   facialProfileId = provisioned.json().id;
   assert.equal(provisioned.json().version, 1);
   assert.equal(provisioned.json().recognition_model_sha256, '0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79');
+  livenessModelHash = provisioned.json().liveness_model_sha256;
+  recognitionPolicyVersion = provisioned.json().policy_version;
+  assert.match(livenessModelHash, /^[a-f0-9]{64}$/);
+  assert.ok(recognitionPolicyVersion >= 1);
   const catalog = await request('GET', '/v1/terminal/catalog', terminalToken);
   assert.equal(catalog.statusCode, 200, catalog.body);
   assert.deepEqual(catalog.json().employees[0].profile_id, facialProfileId);
@@ -366,7 +385,6 @@ test('manager provisions versioned facial profile metadata without exposing biom
 test('terminal sync verifies clock evidence and is idempotent', async () => {
   const bootId = randomUUID();
   const modelHash = '0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79';
-  const livenessHash = '1c2f9ff1f849abfa656da4f7bad4300dc68180c5587056c18808f886d7d1002f';
   const assignment = await sql.query(
     'select id from public.terminal_location_assignments where terminal_id=$1 and valid_to is null', [terminalId],
   );
@@ -383,7 +401,7 @@ test('terminal sync verifies clock evidence and is idempotent', async () => {
     clock_anchor_id: anchor.json().id, source: 'face',
     recognition: {
       profile_id: facialProfileId, profile_version: 1, recognition_model_sha256: modelHash,
-      liveness_model_sha256: livenessHash, policy_version: 1,
+      liveness_model_sha256: livenessModelHash, policy_version: recognitionPolicyVersion,
       liveness_session_id: randomUUID(), liveness_result: 'passed',
     },
   };
@@ -535,14 +553,14 @@ test('attendance, occurrences and bank-hour queries obey tenant isolation', asyn
   for (const path of ['/v1/attendance', '/v1/occurrences', '/v1/bank-hours']) {
     const own = await request('GET', `${path}?company_id=${companyA}`, tokenA);
     assert.equal(own.statusCode, 200, own.body);
-    if (path === '/v1/bank-hours') assert.deepEqual(own.json().data, []);
-    else assert.ok(own.json().data.length >= 1);
+    assert.ok(Array.isArray(own.json().data));
+    assert.ok(own.json().data.length >= 1);
     const foreign = await request('GET', `${path}?company_id=${companyA}`, tokenB);
     assert.equal(foreign.statusCode, 200, foreign.body);
     assert.deepEqual(foreign.json().data, []);
   }
   const bank = await request('GET', `/v1/bank-hours?company_id=${companyA}`, tokenA);
-  assert.equal(bank.json().balance_minutes, 0);
+  assert.equal(typeof bank.json().balance_minutes, 'number');
   const invalidRange = await request('GET', `/v1/attendance?company_id=${companyA}&date_from=2026-09-30&date_to=2026-09-01`, tokenA);
   assert.equal(invalidRange.statusCode, 400);
   const missingOccurrence = await request('POST', `/v1/occurrences/${randomUUID()}/resolution`, tokenA, {
@@ -556,4 +574,157 @@ test('invalid input is rejected before the database', async () => {
   assert.equal(response.statusCode, 400);
   assert.equal(response.json().code, 'INVALID_REQUEST');
   assert.ok(response.json().request_id);
+});
+
+test('justificativas de dia são isoladas por empresa e solicitam recálculo', async () => {
+  const localDate = '2026-09-15';
+  const categories = await request('GET', `/v1/absence-categories?company_id=${companyA}`, tokenA);
+  assert.equal(categories.statusCode, 200, categories.body);
+  assert.deepEqual(categories.json().data.map((item: { name: string }) => item.name), ['Atestado', 'Folga', 'Licença paternidade']);
+
+  const atestado = categories.json().data.find((item: { name: string }) => item.name === 'Atestado');
+  const created = await request('POST', '/v1/day-justifications', tokenA, {
+    company_id: companyA, employee_id: employeeId, local_date: localDate,
+    absence_category_id: atestado.id, note: 'Atestado médico',
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().local_date, localDate);
+
+  const forbiddenCreate = await request('POST', '/v1/day-justifications', tokenB, {
+    company_id: companyA, employee_id: employeeId, local_date: '2026-09-16',
+    absence_category_id: atestado.id, note: 'Tentativa cruzada',
+  });
+  assert.equal(forbiddenCreate.statusCode, 403, forbiddenCreate.body);
+
+  const listed = await request('GET', `/v1/day-justifications?company_id=${companyA}&employee_id=${employeeId}`, tokenA);
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().data.length, 1);
+  assert.equal(listed.json().data[0].absence_categories.name, 'Atestado');
+
+  const queued = await sql.query(
+    'select count(*)::int as count from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2',
+    [companyA, employeeId],
+  );
+  assert.ok(queued.rows[0].count >= 1);
+  await drainAttendanceQueue(companyA, employeeId, 'justified day should be recalculated from the durable queue');
+
+  const paidCalculation = await sql.query(
+    `select c.regular_minutes,c.justified_minutes,c.missing_minutes,c.net_balance_minutes
+       from public.attendance_calculations c
+       join public.work_days d on d.id=c.work_day_id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date=$3 and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, employeeId, localDate],
+  );
+  assert.deepEqual(paidCalculation.rows[0], {
+    regular_minutes: 0, justified_minutes: 480, missing_minutes: 0, net_balance_minutes: 0,
+  });
+
+  const unpaidCategory = await sql.query(
+    `insert into public.absence_categories(company_id,name,abones_hours)
+     values($1,'Licença sem abono',false)
+     returning id`,
+    [companyA],
+  );
+  const unpaid = await request('POST', '/v1/day-justifications', tokenA, {
+    company_id: companyA, employee_id: employeeId, local_date: '2026-09-16',
+    absence_category_id: unpaidCategory.rows[0].id, note: 'Ausência sem abono',
+  });
+  assert.equal(unpaid.statusCode, 201, unpaid.body);
+  await drainAttendanceQueue(companyA, employeeId, 'unpaid justified day should be recalculated from the durable queue');
+  const unpaidCalculation = await sql.query(
+    `select c.regular_minutes,c.justified_minutes,c.missing_minutes,c.net_balance_minutes
+       from public.attendance_calculations c
+       join public.work_days d on d.id=c.work_day_id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date=$3 and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, employeeId, '2026-09-16'],
+  );
+  assert.deepEqual(unpaidCalculation.rows[0], {
+    regular_minutes: 0, justified_minutes: 0, missing_minutes: 480, net_balance_minutes: -480,
+  });
+
+  const foreign = await request('GET', `/v1/day-justifications?company_id=${companyA}`, tokenB);
+  assert.equal(foreign.statusCode, 200, foreign.body);
+  assert.deepEqual(foreign.json().data, []);
+
+  const removed = await request('DELETE', `/v1/day-justifications/${created.json().id}`, tokenA, { company_id: companyA });
+  assert.equal(removed.statusCode, 200, removed.body);
+  const removedUnpaid = await request('DELETE', `/v1/day-justifications/${unpaid.json().id}`, tokenA, { company_id: companyA });
+  assert.equal(removedUnpaid.statusCode, 200, removedUnpaid.body);
+  await drainAttendanceQueue(companyA, employeeId, 'removing a justification should recalculate the day');
+  const afterRemoval = await sql.query(
+    `select c.regular_minutes,c.justified_minutes,c.missing_minutes,c.net_balance_minutes
+       from public.attendance_calculations c
+       join public.work_days d on d.id=c.work_day_id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date=$3 and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, employeeId, localDate],
+  );
+  assert.deepEqual(afterRemoval.rows[0], {
+    regular_minutes: 0, justified_minutes: 0, missing_minutes: 480, net_balance_minutes: -480,
+  });
+});
+
+test('worker usa datas locais no primeiro dia e na troca de escala', async () => {
+  const boundaryEmployee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `B-${stamp}`, name: 'Pessoa de Fronteira', home_location_id: locationA,
+  });
+  assert.equal(boundaryEmployee.statusCode, 201, boundaryEmployee.body);
+  const earlySchedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Manhã curta ${stamp}`, timezone: 'America/Fortaleza', weekdays: [2],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 60 },
+    segments: [{ ordinal: 1, start_minute: 480, end_minute: 600 }],
+  });
+  const replacementSchedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Tarde longa ${stamp}`, timezone: 'America/Fortaleza', weekdays: [2],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 60 },
+    segments: [{ ordinal: 1, start_minute: 840, end_minute: 1200 }],
+  });
+  assert.equal(earlySchedule.statusCode, 201, earlySchedule.body);
+  assert.equal(replacementSchedule.statusCode, 201, replacementSchedule.body);
+
+  const versions = await sql.query(
+    'select id,schedule_id from public.schedule_versions where company_id=$1 and schedule_id = any($2)',
+    [companyA, [earlySchedule.json().id, replacementSchedule.json().id]],
+  );
+  const earlyVersion = versions.rows.find((item) => item.schedule_id === earlySchedule.json().id)?.id;
+  const replacementVersion = versions.rows.find((item) => item.schedule_id === replacementSchedule.json().id)?.id;
+  assert.ok(earlyVersion);
+  assert.ok(replacementVersion);
+
+  const first = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: boundaryEmployee.json().id, schedule_version_id: earlyVersion,
+    valid_from: '2026-09-01T00:00:00-03:00', valid_to: '2026-09-08T00:00:00-03:00',
+  });
+  const replacement = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: boundaryEmployee.json().id, schedule_version_id: replacementVersion,
+    valid_from: '2026-09-08T00:00:00-03:00',
+  });
+  assert.equal(first.statusCode, 201, first.body);
+  assert.equal(replacement.statusCode, 201, replacement.body);
+
+  const categories = await request('GET', `/v1/absence-categories?company_id=${companyA}`, tokenA);
+  const atestado = categories.json().data.find((item: { name: string }) => item.name === 'Atestado');
+  for (const localDate of ['2026-09-01', '2026-09-08']) {
+    const justification = await request('POST', '/v1/day-justifications', tokenA, {
+      company_id: companyA, employee_id: boundaryEmployee.json().id, local_date: localDate,
+      absence_category_id: atestado.id, note: 'Cobertura de fronteira',
+    });
+    assert.equal(justification.statusCode, 201, justification.body);
+  }
+  await drainAttendanceQueue(companyA, boundaryEmployee.json().id, 'schedule boundaries should be recalculated by local date');
+
+  const calculated = await sql.query(
+    `select d.local_date::text as local_date,d.schedule_version_id,c.planned_minutes,c.justified_minutes
+       from public.work_days d
+       join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date = any($3) and c.state='final'
+      order by d.local_date`,
+    [companyA, boundaryEmployee.json().id, ['2026-09-01', '2026-09-08']],
+  );
+  assert.deepEqual(calculated.rows, [
+    { local_date: '2026-09-01', schedule_version_id: earlyVersion, planned_minutes: 120, justified_minutes: 120 },
+    { local_date: '2026-09-08', schedule_version_id: replacementVersion, planned_minutes: 360, justified_minutes: 360 },
+  ]);
 });

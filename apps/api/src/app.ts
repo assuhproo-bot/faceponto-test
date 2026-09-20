@@ -75,6 +75,16 @@ const attendanceQuery = z.object({
   date_from: z.iso.date().optional(), date_to: z.iso.date().optional(),
 }).strict().refine((value) => !value.date_from || !value.date_to || value.date_to >= value.date_from);
 const attendanceReportQuery = attendanceQuery.extend({ format: z.enum(['xlsx', 'pdf']) });
+const absenceCategoriesQuery = z.object({ company_id: z.uuid(), active: z.stringbool().optional() }).strict();
+const dayJustificationsQuery = z.object({
+  company_id: z.uuid(), employee_id: z.uuid().optional(), date_from: z.iso.date().optional(), date_to: z.iso.date().optional(),
+}).strict().refine((value) => !value.date_from || !value.date_to || value.date_to >= value.date_from);
+const dayJustificationBody = z.object({
+  company_id: z.uuid(), employee_id: z.uuid(), local_date: z.iso.date(), absence_category_id: z.uuid(),
+  note: z.string().trim().max(500).nullable().optional(),
+}).strict();
+const dayJustificationParams = z.object({ id: z.uuid() }).strict();
+const deleteDayJustificationBody = z.object({ company_id: z.uuid() }).strict();
 const occurrencesQuery = z.object({
   company_id: z.uuid(), employee_id: z.uuid().optional(), status: z.enum(['open', 'resolved']).optional(),
   severity: z.enum(['warning', 'error']).optional(), type: z.string().trim().min(1).max(80).optional(),
@@ -588,10 +598,54 @@ export function buildApp(config: ApiConfig) {
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return { data };
   });
+  app.get('/v1/absence-categories', async (request, reply) => {
+    const query = absenceCategoriesQuery.parse(request.query);
+    let builder = request.auth!.db.from('absence_categories')
+      .select('id,company_id,name,abones_hours,active,version,created_at,updated_at')
+      .eq('company_id', query.company_id).order('name').limit(200);
+    if (query.active !== undefined) builder = builder.eq('active', query.active);
+    const { data, error: dbError } = await builder;
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
+  app.get('/v1/day-justifications', async (request, reply) => {
+    const query = dayJustificationsQuery.parse(request.query);
+    let builder = request.auth!.db.from('day_justifications')
+      .select('id,company_id,employee_id,local_date,absence_category_id,note,version,created_at,updated_at,absence_categories(id,name,abones_hours,active)')
+      .eq('company_id', query.company_id).order('local_date', { ascending: false }).limit(500);
+    if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
+    if (query.date_from) builder = builder.gte('local_date', query.date_from);
+    if (query.date_to) builder = builder.lte('local_date', query.date_to);
+    const { data, error: dbError } = await builder;
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
+  app.post('/v1/day-justifications', async (request, reply) => {
+    const body = dayJustificationBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('create_day_justification', {
+      p_company: body.company_id,
+      p_employee: body.employee_id,
+      p_local_date: body.local_date,
+      p_absence_category: body.absence_category_id,
+      p_note: body.note ?? null,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
+  });
+  app.delete('/v1/day-justifications/:id', async (request, reply) => {
+    const params = dayJustificationParams.parse(request.params);
+    const body = deleteDayJustificationBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('delete_day_justification', {
+      p_company: body.company_id,
+      p_justification: params.id,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return data;
+  });
   app.get('/v1/attendance', async (request, reply) => {
     const query = attendanceQuery.parse(request.query);
     let builder = request.auth!.db.from('work_days')
-      .select('id,company_id,employee_id,schedule_version_id,journey_start,journey_end,local_date,timezone,attendance_calculations(id,revision,engine_version,rules_version,state,planned_minutes,worked_minutes,late_minutes,late_after_tolerance_minutes,early_departure_minutes,break_minutes,gross_overtime_minutes,overtime_after_tolerance_minutes,net_balance_minutes,classifications,calculated_at)')
+      .select('id,company_id,employee_id,schedule_version_id,journey_start,journey_end,local_date,timezone,attendance_calculations(id,revision,engine_version,rules_version,state,planned_minutes,worked_minutes,regular_minutes,justified_minutes,missing_minutes,late_minutes,late_after_tolerance_minutes,early_departure_minutes,break_minutes,gross_overtime_minutes,overtime_after_tolerance_minutes,net_balance_minutes,classifications,calculated_at)')
       .eq('company_id', query.company_id).order('local_date', { ascending: false }).limit(500);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
     if (query.date_from) builder = builder.gte('local_date', query.date_from);

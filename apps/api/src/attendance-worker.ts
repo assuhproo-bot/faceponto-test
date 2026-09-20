@@ -19,6 +19,7 @@ type Candidate = {
   punches: Array<{ id: string; timestamp: string }>; ambiguous: string[];
 };
 type Adjustment = { id: string; original_time_punch_id: string; corrected_timestamp: string; created_at: string };
+type Justification = { local_date: string; absence_categories: { name: string; abones_hours: boolean } | null };
 
 function localDate(instant: string, timeZone: string) {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
@@ -87,6 +88,13 @@ export function startAttendanceWorker(config: ApiConfig) {
         .gte('local_date', firstDate).lte('local_date', lastDate);
       if (plans.error) throw plans.error;
       const dailyPlans = plans.data as unknown as DailyPlan[];
+      const justifications = await admin.from('day_justifications')
+        .select('local_date,absence_categories(name,abones_hours)')
+        .eq('company_id', job.company_id).eq('employee_id', job.employee_id)
+        .gte('local_date', firstDate).lte('local_date', lastDate);
+      if (justifications.error) throw justifications.error;
+      const justificationsByDate = new Map((justifications.data as unknown as Justification[])
+        .flatMap((item) => item.absence_categories ? [[item.local_date, item.absence_categories] as const] : []));
       const plannedDates = new Set(dailyPlans.map((plan) => plan.local_date));
       const candidates: Candidate[] = [];
       for (const assignment of assignments.data as unknown as Assignment[]) {
@@ -94,7 +102,9 @@ export function startAttendanceWorker(config: ApiConfig) {
         const allowed = new Set(version.schedule_weekdays.map((item) => item.iso_weekday));
         const segments = [...version.schedule_segments].sort((a, b) => a.ordinal - b.ordinal);
         for (const date of datesBetween(firstDate, lastDate)) {
-          if (plannedDates.has(date) || date < assignment.valid_from || (assignment.valid_to && date >= assignment.valid_to) || !allowed.has(isoWeekday(date))) continue;
+          const assignmentFrom = localDate(assignment.valid_from, version.timezone);
+          const assignmentTo = assignment.valid_to ? localDate(assignment.valid_to, version.timezone) : null;
+          if (plannedDates.has(date) || date < assignmentFrom || (assignmentTo && date >= assignmentTo) || !allowed.has(isoWeekday(date))) continue;
           const originMs = zonedMidnight(date, version.timezone);
           candidates.push({ schedule: version, localDate: date, originMs, endMs: originMs + Math.max(...segments.map((item) => item.end_minute)) * 60_000, punches: [], ambiguous: [] });
         }
@@ -137,9 +147,12 @@ export function startAttendanceWorker(config: ApiConfig) {
       }
       const recordCandidate = async (candidate: Candidate) => {
         const version = candidate.schedule;
+        const justification = justificationsByDate.get(candidate.localDate);
         const engineInput = { journey_start: new Date(candidate.originMs).toISOString(), evaluated_at: new Date().toISOString(),
           schedule_version: version.version, rules_version: version.version, rules: version.rules,
-          segments: version.schedule_segments, punches: candidate.punches };
+          segments: version.schedule_segments, punches: candidate.punches,
+          justification: justification ? { abones_hours: justification.abones_hours, category_name: justification.name } : undefined,
+        };
         const result: AttendanceResult = evaluateAttendance(engineInput);
         for (const eventId of candidate.ambiguous) result.occurrences.push({ code: 'AMBIGUOUS_JOURNEY', severity: 'error', definitive: true, event_id: eventId });
         const inputHash = createHash('sha256').update(JSON.stringify(engineInput)).digest('hex');
