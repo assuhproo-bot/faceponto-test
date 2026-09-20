@@ -16,4 +16,12 @@ Retorno: minutos previstos, trabalhados confirmados, atrasos, saídas antecipada
 
 Exemplo de quatro batidas com intervalo 12h..13h30: previsto 08h..18h, realizado 08h05/12h/13h30/18h40. Previsto 510, trabalhado 545, atraso bruto 5, extra bruto 40, saldo +35. Tolerâncias de marcação e do total diário são configuradas separadamente e aplicadas explicitamente. Não esconder atraso dentro da métrica de extra bruto.
 
-Não converter jornada incompleta em saldo final negativo; manter valor provisório e campos finais nulos. Revisão aprovada estorna lançamentos anteriores de banco antes do novo lançamento, sem duplicar crédito. Agregações semanal/mensal respeitam fuso e período, incluindo quantidade distinta de dias atrasados e esquecimentos.
+Não converter um segmento com apenas uma das duas batidas em saldo final negativo; manter esse caso para correção manual, com campos finais nulos. Revisão aprovada estorna lançamentos anteriores de banco antes do novo lançamento, sem duplicar crédito. Agregações semanal/mensal respeitam fuso e período, incluindo quantidade distinta de dias atrasados e esquecimentos.
+
+## Associação por slots da escala
+
+Cada segmento previsto gera dois slots, em ordem cronológica: `Entrada` e `Saída` no primeiro período; entre períodos, `Saída 1` e `Entrada 2`; o último slot é sempre `Saída`. Cada batida é associada ao horário previsto mais próximo. Um empate exato entre dois slots fica como `unclassified` com a ocorrência `AMBIGUOUS_SCHEDULE_SLOT`; o sistema não escolhe uma coluna por tentativa.
+
+Depois que termina a carência da jornada, um segmento inteiro sem as duas batidas vira falta do período, sem criar horários fictícios. Assim, numa escala 08:00–12:00 / 14:00–18:00, as batidas 14:00 e 18:00 são `Entrada 2` e `Saída 2`, com quatro horas de falta pela manhã. Um segmento com apenas uma batida continua incompleto e requer correção, pois não há como inferir a hora que faltou.
+
+`regular_minutes` mede o tempo dentro dos limites previstos; `missing_minutes` mede a parte prevista não coberta; `justified_minutes` cobre essa falta quando a categoria abona horas. O saldo preserva o tempo real trabalhado, incluindo eventual extra, e soma as horas abonadas antes de comparar com a jornada prevista.
