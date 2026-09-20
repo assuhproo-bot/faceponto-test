@@ -11,6 +11,34 @@ export type AttendanceReportRow = {
   overtimeMinutes: number | null;
   missingMinutes: number | null;
   state: string;
+  financialPending: boolean;
+  regularCents: number;
+  justifiedCents: number;
+  overtimeCents: number;
+  shortageCents: number;
+  allowanceCents: number;
+  mealCents: number;
+  dinnerCents: number;
+  dailyAllowanceCents: number;
+  nightShiftCents: number;
+  saturdayCents: number;
+  seraoCents: number;
+  totalCents: number;
+};
+
+export type AttendanceReportFinancialTotals = {
+  regularCents: number;
+  justifiedCents: number;
+  overtimeCents: number;
+  shortageCents: number;
+  allowanceCents: number;
+  mealCents: number;
+  dinnerCents: number;
+  dailyAllowanceCents: number;
+  nightShiftCents: number;
+  saturdayCents: number;
+  seraoCents: number;
+  totalCents: number;
 };
 
 export type AttendanceReport = {
@@ -20,6 +48,7 @@ export type AttendanceReport = {
   from: string | undefined;
   to: string | undefined;
   rows: AttendanceReportRow[];
+  financialTotals: AttendanceReportFinancialTotals;
 };
 
 const xmlEscape = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -33,24 +62,45 @@ const minutes = (value: number | null) => {
 const period = (report: AttendanceReport) => report.from || report.to ? `${report.from ?? 'inicio'} a ${report.to ?? 'hoje'}` : 'Todo o periodo';
 const total = (report: AttendanceReport, field: 'plannedMinutes' | 'workedMinutes' | 'balanceMinutes' | 'overtimeMinutes' | 'missingMinutes') =>
   report.rows.reduce((sum, row) => sum + (row[field] ?? 0), 0);
+const currency = (value: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value / 100);
 
 function cells(values: string[], row: number, style = 0) {
   return values.map((value, index) => `<c r="${columnName(index)}${row}" t="inlineStr" s="${style}"><is><t>${xmlEscape(value)}</t></is></c>`).join('');
 }
 
 export function attendanceXlsx(report: AttendanceReport): Buffer {
-  const header = ['Data', 'Matricula', 'Colaborador', 'Previsto', 'Trabalhado', 'Extra', 'Falta', 'Saldo', 'Estado'];
-  const detail = report.rows.map((row) => [row.date, row.registration, row.employee, minutes(row.plannedMinutes), minutes(row.workedMinutes), minutes(row.overtimeMinutes), minutes(row.missingMinutes), minutes(row.balanceMinutes), row.state]);
-  const summary = ['TOTAL', '', '', minutes(total(report, 'plannedMinutes')), minutes(total(report, 'workedMinutes')), minutes(total(report, 'overtimeMinutes')), minutes(total(report, 'missingMinutes')), minutes(total(report, 'balanceMinutes')), ''];
+  const header = ['Data', 'Matricula', 'Colaborador', 'Previsto', 'Trabalhado', 'Extra', 'Falta', 'Saldo', 'Financeiro', 'Estado'];
+  const detail = report.rows.map((row) => [
+    row.date, row.registration, row.employee, minutes(row.plannedMinutes), minutes(row.workedMinutes),
+    minutes(row.overtimeMinutes), minutes(row.missingMinutes), minutes(row.balanceMinutes),
+    row.financialPending ? `${currency(row.totalCents)} (horas pendentes)` : currency(row.totalCents), row.state,
+  ]);
+  const summary = [
+    'TOTAL', '', '', minutes(total(report, 'plannedMinutes')), minutes(total(report, 'workedMinutes')),
+    minutes(total(report, 'overtimeMinutes')), minutes(total(report, 'missingMinutes')), minutes(total(report, 'balanceMinutes')),
+    `Total financeiro: ${currency(report.financialTotals.totalCents)}`, '',
+  ];
+  const financialHeader = ['Horas normais', 'Horas abonadas', 'Horas extras', 'Desconto faltas', 'Almoço', 'Janta', 'Diária', 'Madrugada', 'Sábado', 'Serão', 'Total financeiro'];
+  const financialSummary = [
+    currency(report.financialTotals.regularCents), currency(report.financialTotals.justifiedCents),
+    currency(report.financialTotals.overtimeCents), currency(report.financialTotals.shortageCents),
+    currency(report.financialTotals.mealCents), currency(report.financialTotals.dinnerCents),
+    currency(report.financialTotals.dailyAllowanceCents), currency(report.financialTotals.nightShiftCents),
+    currency(report.financialTotals.saturdayCents), currency(report.financialTotals.seraoCents),
+    currency(report.financialTotals.totalCents),
+  ];
   const sheetRows = [
-    `<row r="1">${cells([`FacePonto - Relatorio de jornadas - ${report.companyName}`], 1, 2)}</row>`,
+    `<row r="1">${cells([`Pontíficeluga - Relatorio de jornadas - ${report.companyName}`], 1, 2)}</row>`,
     `<row r="2">${cells([`Periodo: ${period(report)} | Fuso: ${report.timezone}`], 2)}</row>`,
     `<row r="3">${cells([`Gerado em: ${report.generatedAt.toISOString()}`], 3)}</row>`,
     `<row r="5">${cells(header, 5, 1)}</row>`,
     ...detail.map((row, index) => `<row r="${index + 6}">${cells(row, index + 6)}</row>`),
     `<row r="${detail.length + 7}">${cells(summary, detail.length + 7, 1)}</row>`,
+    `<row r="${detail.length + 9}">${cells(['Resumo financeiro do período'], detail.length + 9, 2)}</row>`,
+    `<row r="${detail.length + 10}">${cells(financialHeader, detail.length + 10, 1)}</row>`,
+    `<row r="${detail.length + 11}">${cells(financialSummary, detail.length + 11, 1)}</row>`,
   ].join('');
-  const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="14" customWidth="1"/><col min="2" max="2" width="16" customWidth="1"/><col min="3" max="3" width="30" customWidth="1"/><col min="4" max="8" width="14" customWidth="1"/><col min="9" max="9" width="16" customWidth="1"/></cols><sheetData>${sheetRows}</sheetData></worksheet>`;
+  const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="14" customWidth="1"/><col min="2" max="2" width="16" customWidth="1"/><col min="3" max="3" width="30" customWidth="1"/><col min="4" max="9" width="14" customWidth="1"/><col min="10" max="10" width="16" customWidth="1"/></cols><sheetData>${sheetRows}</sheetData></worksheet>`;
   const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFDDEBF7"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="3"><xf fontId="0" fillId="0" borderId="0" xfId="0"/><xf fontId="1" fillId="1" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs></styleSheet>`;
   return Buffer.from(zipSync({
     '[Content_Types].xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'),
@@ -75,11 +125,15 @@ export function attendancePdf(report: AttendanceReport): Promise<Buffer> {
     document.text(`Gerado em: ${report.generatedAt.toISOString()}`);
     document.moveDown().fillColor('#000000');
     document.font('Helvetica-Bold').fontSize(9).text(`Previsto ${minutes(total(report, 'plannedMinutes'))}   Trabalhado ${minutes(total(report, 'workedMinutes'))}   Extra ${minutes(total(report, 'overtimeMinutes'))}   Falta ${minutes(total(report, 'missingMinutes'))}   Saldo ${minutes(total(report, 'balanceMinutes'))}`);
-    document.moveDown().font('Courier-Bold').fontSize(7).text('DATA        MATRICULA       COLABORADOR                PREV.  TRAB.  EXTRA  FALTA  SALDO  ESTADO');
+    document.text(`Normal ${currency(report.financialTotals.regularCents)}   Abonadas ${currency(report.financialTotals.justifiedCents)}   Extra ${currency(report.financialTotals.overtimeCents)}   Desconto faltas ${currency(report.financialTotals.shortageCents)}`);
+    document.text(`Almoço ${currency(report.financialTotals.mealCents)}   Janta ${currency(report.financialTotals.dinnerCents)}   Diária ${currency(report.financialTotals.dailyAllowanceCents)}   Madrugada ${currency(report.financialTotals.nightShiftCents)}`);
+    document.text(`Sábado ${currency(report.financialTotals.saturdayCents)}   Serão ${currency(report.financialTotals.seraoCents)}   Total financeiro: ${currency(report.financialTotals.totalCents)}`);
+    document.moveDown().font('Courier-Bold').fontSize(7).text('DATA        MATRICULA       COLABORADOR                PREV.  TRAB.  EXTRA  FALTA  SALDO  FINANC.   ESTADO');
     document.font('Courier').fontSize(7);
     for (const row of report.rows) {
-      if (document.y > 780) { document.addPage(); document.font('Courier-Bold').text('DATA        MATRICULA       COLABORADOR                PREV.  TRAB.  EXTRA  FALTA  SALDO  ESTADO'); document.font('Courier'); }
-      const line = `${row.date.padEnd(11)} ${row.registration.slice(0, 14).padEnd(14)} ${row.employee.slice(0, 25).padEnd(25)} ${minutes(row.plannedMinutes).padStart(6)} ${minutes(row.workedMinutes).padStart(6)} ${minutes(row.overtimeMinutes).padStart(6)} ${minutes(row.missingMinutes).padStart(6)} ${minutes(row.balanceMinutes).padStart(6)}  ${row.state.slice(0, 12)}`;
+      if (document.y > 780) { document.addPage(); document.font('Courier-Bold').text('DATA        MATRICULA       COLABORADOR                PREV.  TRAB.  EXTRA  FALTA  SALDO  FINANC.   ESTADO'); document.font('Courier'); }
+      const financial = row.financialPending ? 'pendente' : currency(row.totalCents);
+      const line = `${row.date.padEnd(11)} ${row.registration.slice(0, 14).padEnd(14)} ${row.employee.slice(0, 22).padEnd(22)} ${minutes(row.plannedMinutes).padStart(6)} ${minutes(row.workedMinutes).padStart(6)} ${minutes(row.overtimeMinutes).padStart(6)} ${minutes(row.missingMinutes).padStart(6)} ${minutes(row.balanceMinutes).padStart(6)} ${financial.padStart(9)}  ${row.state.slice(0, 12)}`;
       document.text(line);
     }
     if (!report.rows.length) document.font('Helvetica-Oblique').text('Nenhuma jornada encontrada para este filtro.');

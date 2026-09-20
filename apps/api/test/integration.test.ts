@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { createClient } from '@supabase/supabase-js';
+import { strFromU8, unzipSync } from 'fflate';
 import pg from 'pg';
 import { buildApp } from '../src/app.js';
 import { startAttendanceWorker } from '../src/attendance-worker.js';
@@ -326,15 +327,23 @@ test('locations, terminals and schedules are exposed through tenant-scoped API',
     company_id: companyA, location_id: locationA, code: 'X001', name: 'Invasor',
   });
   assert.equal(deniedTerminal.statusCode, 403, deniedTerminal.body);
+  const clock = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Fortaleza', hour12: false, hour: '2-digit', minute: '2-digit',
+  }).formatToParts(new Date()).map((part) => [part.type, part.value]));
+  const currentMinute = Number(clock.hour === '24' ? '0' : clock.hour) * 60 + Number(clock.minute);
+  const scheduleStart = Math.max(0, Math.min(1440 - 480, currentMinute - 240));
+  const scheduleEnd = scheduleStart + 480;
   const schedule = await request('POST', '/v1/schedules', tokenA, {
-    company_id: companyA, name: 'Noturna', timezone: 'America/Fortaleza', weekdays: [1, 2, 3, 4, 5],
+    // This integration schedule must cover the current instant on every day so
+    // the later clock-anchor test is independent from the day and hour it runs.
+    company_id: companyA, name: 'Noturna', timezone: 'America/Fortaleza', weekdays: [1, 2, 3, 4, 5, 6, 7],
     rules: { late_tolerance_minutes: 5, overtime_tolerance_minutes: 5, missing_punch_grace_minutes: 60 },
-    segments: [{ ordinal: 1, start_minute: 1320, end_minute: 1800 }],
+    segments: [{ ordinal: 1, start_minute: scheduleStart, end_minute: scheduleEnd }],
   });
   assert.equal(schedule.statusCode, 201, schedule.body);
   const schedules = await request('GET', `/v1/schedules?company_id=${companyA}`, tokenA);
   assert.equal(schedules.statusCode, 200, schedules.body);
-  assert.equal(schedules.json().data[0].schedule_versions[0].schedule_segments[0].end_minute, 1800);
+  assert.equal(schedules.json().data[0].schedule_versions[0].schedule_segments[0].end_minute, scheduleEnd);
   scheduleVersionId = schedules.json().data[0].schedule_versions[0].id;
   const invalid = await request('POST', '/v1/schedules', tokenA, {
     company_id: companyA, name: 'Inválida', weekdays: [1],
@@ -605,6 +614,36 @@ test('attendance reports export the same tenant-scoped journey data as XLSX and 
   const foreign = await request('GET', `${prefix}&format=pdf`, tokenB);
   assert.equal(foreign.statusCode, 403, foreign.body);
   assert.equal(foreign.json().code, 'FORBIDDEN');
+});
+
+test('financial attendance resolves the same filtered days used by XLSX and PDF', async () => {
+  const paymentDay = await request('POST', '/v1/payment-days', tokenA, {
+    company_id: companyA, employee_id: employeeId, local_date: '2026-10-02',
+    meal_units: 0, dinner_units: 1, daily_allowance_units: 0, night_shift_units: 0, saturday_units: 0, serao_units: 0,
+  });
+  assert.equal(paymentDay.statusCode, 201, paymentDay.body);
+
+  const prefix = `/v1/financial-attendance?company_id=${companyA}&employee_id=${employeeId}&date_from=2026-10-02&date_to=2026-10-02`;
+  const financial = await request('GET', prefix, tokenA);
+  assert.equal(financial.statusCode, 200, financial.body);
+  const row = financial.json().data.find((item: { date: string }) => item.date === '2026-10-02');
+  assert.ok(row);
+  assert.equal(row.financial.allowanceCents, 1200);
+  assert.equal(financial.json().totals.allowanceCents, 1200);
+  assert.equal(financial.json().totals.totalCents, 1200);
+
+  const xlsx = await request('GET', `${prefix.replace('/v1/financial-attendance', '/v1/reports/attendance')}&format=xlsx`, tokenA);
+  assert.equal(xlsx.statusCode, 200, xlsx.body);
+  const entries = unzipSync(xlsx.rawPayload);
+  const sheet = strFromU8(entries['xl/worksheets/sheet1.xml']!);
+  assert.match(sheet, /Financeiro/);
+  assert.match(sheet, /12,00/);
+  const pdf = await request('GET', `${prefix.replace('/v1/financial-attendance', '/v1/reports/attendance')}&format=pdf`, tokenA);
+  assert.equal(pdf.statusCode, 200, pdf.body);
+  assert.deepEqual(pdf.rawPayload.subarray(0, 4), Buffer.from('%PDF'));
+
+  const foreign = await request('GET', prefix, tokenB);
+  assert.equal(foreign.statusCode, 403, foreign.body);
 });
 
 test('administrative punch corrections keep the original and trigger an auditable recalculation', async () => {

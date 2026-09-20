@@ -6,6 +6,7 @@ import { z, ZodError } from 'zod';
 import type { ApiConfig } from './config.js';
 import { authenticate, client, type AuthContext } from './supabase.js';
 import { validateSyncRequest } from '../../../packages/contracts/index.mjs';
+import { resolveDailyFinancials } from '../../../packages/payments/index.mjs';
 import { attendancePdf, attendanceXlsx, type AttendanceReport, type AttendanceReportRow } from './attendance-report.js';
 
 declare module 'fastify' {
@@ -185,24 +186,228 @@ function mapDatabaseError(reply: FastifyReply, request: FastifyRequest, dbError:
   return error(reply, 500, 'INTERNAL_ERROR', 'Não foi possível concluir a operação.', request.id);
 }
 
-type ReportCalculation = { state: string; planned_minutes: number; worked_minutes: number | null; gross_overtime_minutes: number | null; net_balance_minutes: number | null };
-type ReportWorkDay = { employee_id: string; local_date: string; attendance_calculations: ReportCalculation[] };
-type ReportEmployee = { id: string; name: string; registration: string };
+const paymentRateKeys = [
+  'regular_hour_cents', 'overtime_hour_cents', 'serao_cents', 'meal_cents', 'dinner_cents',
+  'daily_allowance_cents', 'night_shift_cents', 'saturday_cents',
+] as const;
+type PaymentRateKey = typeof paymentRateKeys[number];
+type ResolvedPaymentRate = { cents: number; source: 'employee' | 'department' | 'company' | 'none' };
+type ResolvedPaymentRates = Record<PaymentRateKey, ResolvedPaymentRate>;
+type PaymentSettings = Partial<Record<PaymentRateKey, number | null>>;
+type ReportCalculation = {
+  state: string; revision: number; planned_minutes: number; worked_minutes: number | null; regular_minutes: number | null;
+  justified_minutes: number | null; missing_minutes: number | null; gross_overtime_minutes: number | null;
+  net_balance_minutes: number | null;
+};
+type ReportWorkDay = { employee_id: string; local_date: string; attendance_calculations: ReportCalculation[] | null };
+type ReportEmployee = { id: string; name: string; registration: string; department_id: string | null };
+type PaymentDay = {
+  employee_id: string; local_date: string; meal_units: number; dinner_units: number; daily_allowance_units: number;
+  night_shift_units: number; saturday_units: number; serao_units: number;
+};
+type AbsenceCategory = { name: string; abones_hours: boolean };
+type DayJustification = { employee_id: string; local_date: string; absence_categories: AbsenceCategory | AbsenceCategory[] | null };
+type AllowanceKey = 'meal' | 'dinner' | 'daily_allowance' | 'night_shift' | 'saturday' | 'serao';
+type DailyFinancials = {
+  regularCents: number; justifiedCents: number; overtimeCents: number; shortageCents: number; allowanceCents: number;
+  allowanceCentsByKey: Record<AllowanceKey, number>; totalCents: number;
+  lines: Array<{ key: string; kind: string; label: string; cents: number; minutes?: number; units?: number; rateCents: number }>;
+};
+type FinancialAttendanceRow = {
+  employeeId: string; date: string; employee: string; registration: string; state: string;
+  plannedMinutes: number; workedMinutes: number | null; regularMinutes: number | null; justifiedMinutes: number | null;
+  missingMinutes: number | null; overtimeMinutes: number | null; balanceMinutes: number | null;
+  financialPending: boolean; financial: DailyFinancials; rates: ResolvedPaymentRates;
+};
+type FinancialAttendance = {
+  company: { name: string; timezone: string }; from: string | undefined; to: string | undefined; rows: FinancialAttendanceRow[];
+  totals: { plannedMinutes: number; workedMinutes: number; regularMinutes: number; justifiedMinutes: number; missingMinutes: number; overtimeMinutes: number; balanceMinutes: number; regularCents: number; justifiedCents: number; overtimeCents: number; shortageCents: number; allowanceCents: number; mealCents: number; dinnerCents: number; dailyAllowanceCents: number; nightShiftCents: number; saturdayCents: number; seraoCents: number; totalCents: number };
+};
+type FinancialAttendanceBuildResult =
+  | { kind: 'ok'; value: FinancialAttendance }
+  | { kind: 'forbidden' }
+  | { kind: 'db-error'; error: { code?: string; message: string } };
 
-function toAttendanceReport(
-  company: { name: string; timezone: string }, query: { date_from?: string | undefined; date_to?: string | undefined }, days: ReportWorkDay[], employees: ReportEmployee[],
-): AttendanceReport {
+function dayKey(employeeId: string, localDate: string) { return `${employeeId}:${localDate}`; }
+
+function currentCalculation(calculations: ReportCalculation[] | null | undefined) {
+  return [...(calculations ?? [])]
+    .filter((item) => item.state !== 'superseded')
+    .sort((left, right) => right.revision - left.revision)[0];
+}
+
+function absenceCategory(justification: DayJustification | undefined) {
+  const categories = justification?.absence_categories;
+  return Array.isArray(categories) ? categories[0] ?? null : categories ?? null;
+}
+
+function resolvedRates(
+  employee: PaymentSettings | undefined, department: PaymentSettings | undefined, company: PaymentSettings | undefined,
+): ResolvedPaymentRates {
+  return Object.fromEntries(paymentRateKeys.map((key) => {
+    const employeeValue = employee?.[key];
+    if (employeeValue != null) return [key, { cents: employeeValue, source: 'employee' as const }];
+    const departmentValue = department?.[key];
+    if (departmentValue != null) return [key, { cents: departmentValue, source: 'department' as const }];
+    const companyValue = company?.[key];
+    if (companyValue != null) return [key, { cents: companyValue, source: 'company' as const }];
+    return [key, { cents: 0, source: 'none' as const }];
+  })) as ResolvedPaymentRates;
+}
+
+function sumRows(rows: FinancialAttendanceRow[], getter: (row: FinancialAttendanceRow) => number | null) {
+  return rows.reduce((sum, row) => sum + (getter(row) ?? 0), 0);
+}
+
+type PagedResult = { data: unknown[] | null; error: { code?: string; message: string } | null };
+type PagedRequest = { range: (from: number, to: number) => PromiseLike<PagedResult> };
+
+async function fetchAllPages(request: PagedRequest): Promise<PagedResult> {
+  const data: unknown[] = [];
+  const pageSize = 1_000;
+  for (let from = 0; ; from += pageSize) {
+    const page = await request.range(from, from + pageSize - 1);
+    if (page.error) return { data: null, error: page.error };
+    const rows = page.data ?? [];
+    data.push(...rows);
+    if (rows.length < pageSize) return { data, error: null };
+  }
+}
+
+async function buildFinancialAttendance(
+  db: AuthContext['db'], userId: string, query: z.infer<typeof attendanceQuery>,
+): Promise<FinancialAttendanceBuildResult> {
+  let daysRequest = db.from('work_days')
+    .select('employee_id,local_date,attendance_calculations(state,revision,planned_minutes,worked_minutes,regular_minutes,justified_minutes,missing_minutes,gross_overtime_minutes,net_balance_minutes)')
+    .eq('company_id', query.company_id).order('local_date', { ascending: true }).order('employee_id', { ascending: true });
+  let employeesRequest = db.from('employees').select('id,name,registration,department_id')
+    .eq('company_id', query.company_id).order('name').order('id');
+  let employeeRatesRequest = db.from('employee_payment_settings')
+    .select(`employee_id,${paymentRateKeys.join(',')}`).eq('company_id', query.company_id).order('employee_id');
+  let paymentDaysRequest = db.from('employee_payment_days')
+    .select('employee_id,local_date,meal_units,dinner_units,daily_allowance_units,night_shift_units,saturday_units,serao_units')
+    .eq('company_id', query.company_id).order('local_date', { ascending: true }).order('employee_id');
+  let justificationsRequest = db.from('day_justifications')
+    .select('employee_id,local_date,absence_categories(name,abones_hours)')
+    .eq('company_id', query.company_id).order('local_date', { ascending: true }).order('employee_id');
+  if (query.employee_id) {
+    daysRequest = daysRequest.eq('employee_id', query.employee_id);
+    employeesRequest = employeesRequest.eq('id', query.employee_id);
+    employeeRatesRequest = employeeRatesRequest.eq('employee_id', query.employee_id);
+    paymentDaysRequest = paymentDaysRequest.eq('employee_id', query.employee_id);
+    justificationsRequest = justificationsRequest.eq('employee_id', query.employee_id);
+  }
+  if (query.date_from) {
+    daysRequest = daysRequest.gte('local_date', query.date_from);
+    paymentDaysRequest = paymentDaysRequest.gte('local_date', query.date_from);
+    justificationsRequest = justificationsRequest.gte('local_date', query.date_from);
+  }
+  if (query.date_to) {
+    daysRequest = daysRequest.lte('local_date', query.date_to);
+    paymentDaysRequest = paymentDaysRequest.lte('local_date', query.date_to);
+    justificationsRequest = justificationsRequest.lte('local_date', query.date_to);
+  }
+  const [daysResult, employeesResult, companyResult, membershipResult, companyRatesResult, departmentRatesResult, employeeRatesResult, paymentDaysResult, justificationsResult] = await Promise.all([
+    fetchAllPages(daysRequest),
+    fetchAllPages(employeesRequest),
+    db.from('companies').select('name,timezone').eq('id', query.company_id).maybeSingle(),
+    db.from('company_memberships').select('role').eq('company_id', query.company_id).eq('user_id', userId).eq('active', true).maybeSingle(),
+    db.from('company_payment_settings').select(paymentRateKeys.join(',')).eq('company_id', query.company_id).maybeSingle(),
+    fetchAllPages(db.from('department_payment_settings').select(`department_id,${paymentRateKeys.join(',')}`).eq('company_id', query.company_id).order('department_id')),
+    fetchAllPages(employeeRatesRequest),
+    fetchAllPages(paymentDaysRequest),
+    fetchAllPages(justificationsRequest),
+  ]);
+  if (!companyResult.data || !membershipResult.data || !['administrator', 'hr'].includes(membershipResult.data.role)) return { kind: 'forbidden' };
+  const dbError = [daysResult, employeesResult, companyResult, membershipResult, companyRatesResult, departmentRatesResult, employeeRatesResult, paymentDaysResult, justificationsResult]
+    .map((result) => result.error).find((result) => result != null);
+  if (dbError) return { kind: 'db-error', error: dbError };
+
+  const employees = (employeesResult.data ?? []) as unknown as ReportEmployee[];
+  const days = (daysResult.data ?? []) as unknown as ReportWorkDay[];
+  const paymentDays = (paymentDaysResult.data ?? []) as unknown as PaymentDay[];
+  const justifications = (justificationsResult.data ?? []) as unknown as DayJustification[];
   const employeeById = new Map(employees.map((employee) => [employee.id, employee]));
-  const rows: AttendanceReportRow[] = days.map((day) => {
-    const calculation = day.attendance_calculations.find((item) => item.state !== 'superseded') ?? day.attendance_calculations[0];
-    const employee = employeeById.get(day.employee_id);
-    return {
-      date: day.local_date, employee: employee?.name ?? day.employee_id, registration: employee?.registration ?? '-',
+  const daysByKey = new Map(days.map((day) => [dayKey(day.employee_id, day.local_date), day]));
+  const paymentDaysByKey = new Map(paymentDays.map((day) => [dayKey(day.employee_id, day.local_date), day]));
+  const justificationsByKey = new Map(justifications.map((item) => [dayKey(item.employee_id, item.local_date), item]));
+  const employeeRatesByEmployee = new Map(((employeeRatesResult.data ?? []) as unknown as Array<PaymentSettings & { employee_id: string }>)
+    .map((item) => [item.employee_id, item]));
+  const departmentRatesByDepartment = new Map(((departmentRatesResult.data ?? []) as unknown as Array<PaymentSettings & { department_id: string }>)
+    .map((item) => [item.department_id, item]));
+  const companyRates = (companyRatesResult.data ?? undefined) as PaymentSettings | undefined;
+  const keys = new Set([...daysByKey.keys(), ...paymentDaysByKey.keys(), ...justificationsByKey.keys()]);
+  const rows: FinancialAttendanceRow[] = [...keys].flatMap((key) => {
+    const day = daysByKey.get(key);
+    const paymentDay = paymentDaysByKey.get(key);
+    const justification = justificationsByKey.get(key);
+    const [employeeId, date] = key.split(':');
+    const employee = employeeId ? employeeById.get(employeeId) : undefined;
+    if (!employee || !date) return [];
+    const calculation = currentCalculation(day?.attendance_calculations);
+    const rates = resolvedRates(employeeRatesByEmployee.get(employee.id), departmentRatesByDepartment.get(employee.department_id ?? ''), companyRates);
+    const financialPending = calculation?.state === 'provisional';
+    const financial = resolveDailyFinancials({
+      calculation: calculation?.state === 'final' ? calculation : {}, rates,
+      additions: paymentDay ?? {}, justification: absenceCategory(justification),
+    }) as DailyFinancials;
+    return [{
+      employeeId: employee.id, date, employee: employee.name, registration: employee.registration, state: calculation?.state ?? 'sem cálculo',
       plannedMinutes: calculation?.planned_minutes ?? 0, workedMinutes: calculation?.worked_minutes ?? null,
-      balanceMinutes: calculation?.net_balance_minutes ?? null, overtimeMinutes: calculation?.gross_overtime_minutes ?? null, missingMinutes: calculation?.net_balance_minutes != null ? Math.max(0, -calculation.net_balance_minutes) : null, state: calculation?.state ?? 'sem calculo',
-    };
+      regularMinutes: calculation?.regular_minutes ?? null, justifiedMinutes: calculation?.justified_minutes ?? null,
+      missingMinutes: calculation?.missing_minutes ?? null, overtimeMinutes: calculation?.gross_overtime_minutes ?? null,
+      balanceMinutes: calculation?.net_balance_minutes ?? null, financialPending, financial, rates,
+    }];
   }).sort((left, right) => left.date.localeCompare(right.date) || left.employee.localeCompare(right.employee));
-  return { companyName: company.name, timezone: company.timezone, generatedAt: new Date(), from: query.date_from, to: query.date_to, rows };
+  return {
+    kind: 'ok',
+    value: {
+      company: companyResult.data as { name: string; timezone: string }, from: query.date_from, to: query.date_to, rows,
+      totals: {
+        plannedMinutes: sumRows(rows, (row) => row.plannedMinutes), workedMinutes: sumRows(rows, (row) => row.workedMinutes),
+        regularMinutes: sumRows(rows, (row) => row.regularMinutes), justifiedMinutes: sumRows(rows, (row) => row.justifiedMinutes),
+        missingMinutes: sumRows(rows, (row) => row.missingMinutes), overtimeMinutes: sumRows(rows, (row) => row.overtimeMinutes),
+        balanceMinutes: sumRows(rows, (row) => row.balanceMinutes), regularCents: sumRows(rows, (row) => row.financial.regularCents),
+        justifiedCents: sumRows(rows, (row) => row.financial.justifiedCents),
+        overtimeCents: sumRows(rows, (row) => row.financial.overtimeCents), shortageCents: sumRows(rows, (row) => row.financial.shortageCents),
+        allowanceCents: sumRows(rows, (row) => row.financial.allowanceCents), totalCents: sumRows(rows, (row) => row.financial.totalCents),
+        mealCents: sumRows(rows, (row) => row.financial.allowanceCentsByKey.meal),
+        dinnerCents: sumRows(rows, (row) => row.financial.allowanceCentsByKey.dinner),
+        dailyAllowanceCents: sumRows(rows, (row) => row.financial.allowanceCentsByKey.daily_allowance),
+        nightShiftCents: sumRows(rows, (row) => row.financial.allowanceCentsByKey.night_shift),
+        saturdayCents: sumRows(rows, (row) => row.financial.allowanceCentsByKey.saturday),
+        seraoCents: sumRows(rows, (row) => row.financial.allowanceCentsByKey.serao),
+      },
+    },
+  };
+}
+
+function toAttendanceReport(financialAttendance: FinancialAttendance): AttendanceReport {
+  const rows: AttendanceReportRow[] = financialAttendance.rows.map((row) => ({
+    date: row.date, employee: row.employee, registration: row.registration,
+    plannedMinutes: row.plannedMinutes, workedMinutes: row.workedMinutes, balanceMinutes: row.balanceMinutes,
+    overtimeMinutes: row.overtimeMinutes, missingMinutes: row.missingMinutes, state: row.state,
+    financialPending: row.financialPending, regularCents: row.financial.regularCents,
+    justifiedCents: row.financial.justifiedCents, overtimeCents: row.financial.overtimeCents,
+    shortageCents: row.financial.shortageCents, allowanceCents: row.financial.allowanceCents,
+    mealCents: row.financial.allowanceCentsByKey.meal, dinnerCents: row.financial.allowanceCentsByKey.dinner,
+    dailyAllowanceCents: row.financial.allowanceCentsByKey.daily_allowance,
+    nightShiftCents: row.financial.allowanceCentsByKey.night_shift,
+    saturdayCents: row.financial.allowanceCentsByKey.saturday,
+    seraoCents: row.financial.allowanceCentsByKey.serao, totalCents: row.financial.totalCents,
+  }));
+  return {
+    companyName: financialAttendance.company.name, timezone: financialAttendance.company.timezone, generatedAt: new Date(),
+    from: financialAttendance.from, to: financialAttendance.to, rows,
+    financialTotals: {
+      regularCents: financialAttendance.totals.regularCents, justifiedCents: financialAttendance.totals.justifiedCents,
+      overtimeCents: financialAttendance.totals.overtimeCents, shortageCents: financialAttendance.totals.shortageCents,
+      allowanceCents: financialAttendance.totals.allowanceCents, mealCents: financialAttendance.totals.mealCents,
+      dinnerCents: financialAttendance.totals.dinnerCents, dailyAllowanceCents: financialAttendance.totals.dailyAllowanceCents,
+      nightShiftCents: financialAttendance.totals.nightShiftCents, saturdayCents: financialAttendance.totals.saturdayCents,
+      seraoCents: financialAttendance.totals.seraoCents, totalCents: financialAttendance.totals.totalCents,
+    },
+  };
 }
 
 export function buildApp(config: ApiConfig) {
@@ -743,25 +948,19 @@ export function buildApp(config: ApiConfig) {
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return { data };
   });
+  app.get('/v1/financial-attendance', async (request, reply) => {
+    const query = attendanceQuery.parse(request.query);
+    const result = await buildFinancialAttendance(request.auth!.db, request.auth!.user.id, query);
+    if (result.kind === 'forbidden') return error(reply, 403, 'FORBIDDEN', 'Você não tem permissão para esta operação.', request.id);
+    if (result.kind === 'db-error') return mapDatabaseError(reply, request, result.error);
+    return { data: result.value.rows, totals: result.value.totals };
+  });
   app.get('/v1/reports/attendance', async (request, reply) => {
     const query = attendanceReportQuery.parse(request.query);
-    let daysRequest = request.auth!.db.from('work_days')
-      .select('employee_id,local_date,attendance_calculations(state,planned_minutes,worked_minutes,gross_overtime_minutes,net_balance_minutes)')
-      .eq('company_id', query.company_id).order('local_date', { ascending: true }).limit(5_000);
-    if (query.employee_id) daysRequest = daysRequest.eq('employee_id', query.employee_id);
-    if (query.date_from) daysRequest = daysRequest.gte('local_date', query.date_from);
-    if (query.date_to) daysRequest = daysRequest.lte('local_date', query.date_to);
-    const [daysResult, employeesResult, companyResult] = await Promise.all([
-      daysRequest,
-      request.auth!.db.from('employees').select('id,name,registration').eq('company_id', query.company_id).limit(5_000),
-      request.auth!.db.from('companies').select('name,timezone').eq('id', query.company_id).single(),
-    ]);
-    if (!companyResult.data) return error(reply, 403, 'FORBIDDEN', 'Você não tem permissão para esta operação.', request.id);
-    const dbError = daysResult.error ?? employeesResult.error ?? companyResult.error;
-    if (dbError) return mapDatabaseError(reply, request, dbError);
-    const report = toAttendanceReport(
-      companyResult.data, query, daysResult.data as ReportWorkDay[], employeesResult.data as ReportEmployee[],
-    );
+    const result = await buildFinancialAttendance(request.auth!.db, request.auth!.user.id, query);
+    if (result.kind === 'forbidden') return error(reply, 403, 'FORBIDDEN', 'Você não tem permissão para esta operação.', request.id);
+    if (result.kind === 'db-error') return mapDatabaseError(reply, request, result.error);
+    const report = toAttendanceReport(result.value);
     const extension = query.format;
     const payload = extension === 'xlsx' ? attendanceXlsx(report) : await attendancePdf(report);
     const type = extension === 'xlsx'
