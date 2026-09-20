@@ -68,6 +68,8 @@ Uma justificativa abonada mostra:
 - Horas faltantes: zero para o período abonado.
 - Saldo de horas: sem desconto pelo período abonado.
 
+As horas abonadas entram no valor de hora normal daquele dia, para que a justificativa não gere desconto financeiro.
+
 Uma justificativa sem abono mantém as faltas e os descontos, mas identifica o motivo na apuração e no relatório. Alterar ou remover a justificativa reprocessa o dia com histórico auditável.
 
 ## Cargos e valores de pagamento
