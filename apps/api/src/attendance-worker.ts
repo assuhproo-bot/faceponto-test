@@ -19,7 +19,40 @@ type Candidate = {
   punches: Array<{ id: string; timestamp: string }>; ambiguous: string[];
 };
 type Adjustment = { id: string; original_time_punch_id: string; corrected_timestamp: string; created_at: string };
-type Justification = { local_date: string; absence_categories: { name: string; abones_hours: boolean } | null };
+type Justification = { local_date: string; abones_hours: boolean; absence_categories: { name: string } | null };
+
+const WORKER_PAGE_SIZE = 1_000;
+const CANDIDATE_PUNCH_GRACE_MS = 4 * 3_600_000;
+
+/**
+ * PostgREST enforces a maximum response size. Attendance jobs may cover more
+ * than that limit when a terminal has retried events, so every worker read
+ * must advance through stable, ordered pages instead of silently truncating.
+ */
+async function readAll<T>(fetchPage: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>): Promise<T[]> {
+  const rows: T[] = [];
+  for (let from = 0; ; from += WORKER_PAGE_SIZE) {
+    const page = await fetchPage(from, from + WORKER_PAGE_SIZE - 1);
+    if (page.error) throw page.error;
+    const batch = (page.data ?? []) as T[];
+    rows.push(...batch);
+    if (batch.length < WORKER_PAGE_SIZE) return rows;
+  }
+}
+
+function timestampWindow(job: Job, candidates: Candidate[]) {
+  const affectedFrom = Date.parse(job.affected_from);
+  const affectedTo = Date.parse(job.affected_to);
+  if (!Number.isFinite(affectedFrom) || !Number.isFinite(affectedTo)) throw new Error('Invalid attendance recalculation window');
+  const candidateFrom = candidates.length
+    ? Math.min(...candidates.map((candidate) => candidate.originMs - CANDIDATE_PUNCH_GRACE_MS)) : affectedFrom;
+  const candidateTo = candidates.length
+    ? Math.max(...candidates.map((candidate) => candidate.endMs + CANDIDATE_PUNCH_GRACE_MS)) : affectedTo;
+  return {
+    from: new Date(Math.min(affectedFrom, candidateFrom)).toISOString(),
+    to: new Date(Math.max(affectedTo, candidateTo)).toISOString(),
+  };
+}
 
 function localDate(instant: string, timeZone: string) {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
@@ -70,34 +103,33 @@ export function startAttendanceWorker(config: ApiConfig) {
       if (claimed.error) throw claimed.error;
       job = claimed.data as Job | null;
       if (!job) return false;
-      const company = await admin.from('companies').select('timezone').eq('id', job.company_id).single();
+      const activeJob = job;
+      const company = await admin.from('companies').select('timezone').eq('id', activeJob.company_id).single();
       if (company.error) throw company.error;
       const timeZone = company.data.timezone as string;
-      const firstDate = localDate(job.affected_from, timeZone);
-      const affectedLastDate = localDate(job.affected_to, timeZone);
+      const firstDate = localDate(activeJob.affected_from, timeZone);
+      const affectedLastDate = localDate(activeJob.affected_to, timeZone);
       const today = localDate(new Date().toISOString(), timeZone);
       const lastDate = affectedLastDate < today ? affectedLastDate : today;
-      const assignments = await admin.from('schedule_assignments')
+      const assignments = await readAll<Assignment>((from, to) => admin.from('schedule_assignments')
         .select('valid_from,valid_to,schedule_versions(id,version,timezone,rules,schedule_weekdays(iso_weekday),schedule_segments(ordinal,start_minute,end_minute))')
-        .eq('company_id', job.company_id).eq('employee_id', job.employee_id).lte('valid_from', lastDate)
-        .or(`valid_to.is.null,valid_to.gte.${firstDate}`);
-      if (assignments.error) throw assignments.error;
-      const plans = await admin.from('employee_schedule_plans')
+        .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id).lte('valid_from', lastDate)
+        .or(`valid_to.is.null,valid_to.gte.${firstDate}`).order('valid_from').order('id').range(from, to));
+      const dailyPlans = await readAll<DailyPlan>((from, to) => admin.from('employee_schedule_plans')
         .select('local_date,schedule_versions(id,version,timezone,rules,schedule_weekdays(iso_weekday),schedule_segments(ordinal,start_minute,end_minute))')
-        .eq('company_id', job.company_id).eq('employee_id', job.employee_id).eq('active', true)
-        .gte('local_date', firstDate).lte('local_date', lastDate);
-      if (plans.error) throw plans.error;
-      const dailyPlans = plans.data as unknown as DailyPlan[];
-      const justifications = await admin.from('day_justifications')
-        .select('local_date,absence_categories(name,abones_hours)')
-        .eq('company_id', job.company_id).eq('employee_id', job.employee_id)
-        .gte('local_date', firstDate).lte('local_date', lastDate);
-      if (justifications.error) throw justifications.error;
-      const justificationsByDate = new Map((justifications.data as unknown as Justification[])
-        .flatMap((item) => item.absence_categories ? [[item.local_date, item.absence_categories] as const] : []));
+        .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id).eq('active', true)
+        .gte('local_date', firstDate).lte('local_date', lastDate).order('local_date').order('id').range(from, to));
+      const justifications = await readAll<Justification>((from, to) => admin.from('day_justifications')
+        .select('local_date,abones_hours,absence_categories(name)')
+        .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id)
+        .gte('local_date', firstDate).lte('local_date', lastDate).order('local_date').order('id').range(from, to));
+      const justificationsByDate = new Map(justifications
+        .flatMap((item) => item.absence_categories
+          ? [[item.local_date, { abones_hours: item.abones_hours, name: item.absence_categories.name }] as const]
+          : []));
       const plannedDates = new Set(dailyPlans.map((plan) => plan.local_date));
       const candidates: Candidate[] = [];
-      for (const assignment of assignments.data as unknown as Assignment[]) {
+      for (const assignment of assignments) {
         const version = assignment.schedule_versions;
         const allowed = new Set(version.schedule_weekdays.map((item) => item.iso_weekday));
         const segments = [...version.schedule_segments].sort((a, b) => a.ordinal - b.ordinal);
@@ -115,31 +147,45 @@ export function startAttendanceWorker(config: ApiConfig) {
         const originMs = zonedMidnight(plan.local_date, version.timezone);
         candidates.push({ schedule: version, localDate: plan.local_date, originMs, endMs: originMs + Math.max(...segments.map((item) => item.end_minute)) * 60_000, punches: [], ambiguous: [] });
       }
-      const punches = await admin.from('time_punches').select('id,timestamp').eq('company_id', job.company_id)
-        .eq('employee_id', job.employee_id).eq('sync_status', 'accepted').gte('timestamp', job.affected_from).lte('timestamp', job.affected_to)
-        .order('timestamp').order('id');
-      if (punches.error) throw punches.error;
-      const adjustments = await admin.from('punch_adjustments').select('id,original_time_punch_id,corrected_timestamp,created_at')
-        .eq('company_id', job.company_id).eq('employee_id', job.employee_id)
-        .gte('corrected_timestamp', job.affected_from).lte('corrected_timestamp', job.affected_to)
-        .order('created_at', { ascending: false }).order('id', { ascending: false });
-      if (adjustments.error) throw adjustments.error;
-      const manualPunches = await admin.from('manual_punches').select('id,timestamp')
-        .eq('company_id', job.company_id).eq('employee_id', job.employee_id)
-        .gte('timestamp', job.affected_from).lte('timestamp', job.affected_to).order('timestamp').order('id');
-      if (manualPunches.error) throw manualPunches.error;
+      const punchWindow = timestampWindow(activeJob, candidates);
+      const punches = await readAll<{ id: string; timestamp: string }>((from, to) => admin.from('time_punches').select('id,timestamp')
+        .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id).eq('sync_status', 'accepted')
+        .gte('timestamp', punchWindow.from).lte('timestamp', punchWindow.to).order('timestamp').order('id').range(from, to));
+      const adjustmentsMovedIntoWindow = await readAll<Adjustment>((from, to) => admin.from('punch_adjustments')
+        .select('id,original_time_punch_id,corrected_timestamp,created_at')
+        .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id)
+        .gte('corrected_timestamp', punchWindow.from).lte('corrected_timestamp', punchWindow.to)
+        .order('created_at', { ascending: false }).order('id', { ascending: false }).range(from, to));
+      const adjustmentOriginalIds = [...new Set([
+        ...punches.map((punch) => punch.id),
+        ...adjustmentsMovedIntoWindow.map((adjustment) => adjustment.original_time_punch_id),
+      ])];
+      const adjustmentsForOriginals: Adjustment[] = [];
+      for (let index = 0; index < adjustmentOriginalIds.length; index += 200) {
+        const originalIds = adjustmentOriginalIds.slice(index, index + 200);
+        adjustmentsForOriginals.push(...await readAll<Adjustment>((from, to) => admin.from('punch_adjustments')
+          .select('id,original_time_punch_id,corrected_timestamp,created_at')
+          .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id).in('original_time_punch_id', originalIds)
+          .order('created_at', { ascending: false }).order('id', { ascending: false }).range(from, to)));
+      }
+      const manualPunches = await readAll<{ id: string; timestamp: string }>((from, to) => admin.from('manual_punches').select('id,timestamp')
+        .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id)
+        .gte('timestamp', punchWindow.from).lte('timestamp', punchWindow.to).order('timestamp').order('id').range(from, to));
+      const adjustments = [...new Map([...adjustmentsMovedIntoWindow, ...adjustmentsForOriginals]
+        .map((adjustment) => [adjustment.id, adjustment])).values()]
+        .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id));
       const currentAdjustments = new Map<string, Adjustment>();
-      for (const adjustment of adjustments.data as Adjustment[]) {
+      for (const adjustment of adjustments) {
         if (!currentAdjustments.has(adjustment.original_time_punch_id)) currentAdjustments.set(adjustment.original_time_punch_id, adjustment);
       }
       const effectivePunches = [
-        ...(punches.data.filter((punch) => !currentAdjustments.has(punch.id))),
+        ...punches.filter((punch) => !currentAdjustments.has(punch.id)),
         ...[...currentAdjustments.values()].map((adjustment) => ({ id: adjustment.id, timestamp: adjustment.corrected_timestamp })),
-        ...(manualPunches.data ?? []).map((punch) => ({ id: punch.id, timestamp: punch.timestamp })),
+        ...manualPunches.map((punch) => ({ id: punch.id, timestamp: punch.timestamp })),
       ].sort((left, right) => left.timestamp.localeCompare(right.timestamp) || left.id.localeCompare(right.id));
       for (const punch of effectivePunches) {
         const instant = Date.parse(punch.timestamp); const eligible = candidates
-          .filter((candidate) => instant >= candidate.originMs - 4 * 3_600_000 && instant <= candidate.endMs + 4 * 3_600_000)
+          .filter((candidate) => instant >= candidate.originMs - CANDIDATE_PUNCH_GRACE_MS && instant <= candidate.endMs + CANDIDATE_PUNCH_GRACE_MS)
           .map((candidate) => ({ candidate, distance: distanceTo(candidate, instant) })).sort((a, b) => a.distance - b.distance);
         if (!eligible.length) continue;
         if (eligible[1]?.distance === eligible[0]?.distance) eligible.filter((item) => item.distance === eligible[0]?.distance).forEach((item) => item.candidate.ambiguous.push(punch.id));
@@ -157,7 +203,7 @@ export function startAttendanceWorker(config: ApiConfig) {
         for (const eventId of candidate.ambiguous) result.occurrences.push({ code: 'AMBIGUOUS_JOURNEY', severity: 'error', definitive: true, event_id: eventId });
         const inputHash = createHash('sha256').update(JSON.stringify(engineInput)).digest('hex');
         const recorded = await admin.rpc('record_attendance_calculation', {
-          p_company: job!.company_id, p_employee: job!.employee_id, p_schedule_version: version.id,
+          p_company: activeJob.company_id, p_employee: activeJob.employee_id, p_schedule_version: version.id,
           p_journey_start: new Date(candidate.originMs).toISOString(), p_journey_end: new Date(candidate.endMs).toISOString(),
           p_local_date: candidate.localDate, p_timezone: version.timezone, p_result: result, p_input_sha256: inputHash,
         });
@@ -168,7 +214,7 @@ export function startAttendanceWorker(config: ApiConfig) {
         await Promise.all(candidates.slice(index, index + 6).map(recordCandidate));
       }
       const completed = await admin.rpc('complete_attendance_recalculation', {
-        p_company: job.company_id, p_employee: job.employee_id, p_lease_token: job.lease_token, p_requested_at: job.requested_at,
+        p_company: activeJob.company_id, p_employee: activeJob.employee_id, p_lease_token: activeJob.lease_token, p_requested_at: activeJob.requested_at,
       });
       if (completed.error) throw completed.error;
       return true;

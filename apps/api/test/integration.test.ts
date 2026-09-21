@@ -65,6 +65,46 @@ async function drainAttendanceQueue(companyId: string, targetEmployeeId: string,
     stopWorker();
   }
 }
+async function replaceAttendanceQueue(companyId: string, targetEmployeeId: string, affectedFrom: string, affectedTo: string) {
+  await sql.query('delete from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2', [companyId, targetEmployeeId]);
+  await sql.query(
+    `insert into private.attendance_recalculation_queue(company_id,employee_id,affected_from,affected_to)
+     values($1,$2,$3,$4)`,
+    [companyId, targetEmployeeId, affectedFrom, affectedTo],
+  );
+}
+async function insertAcceptedPunch(companyId: string, targetEmployeeId: string, timestamp: string) {
+  const assignment = await sql.query(
+    `select id,location_id from public.terminal_location_assignments
+      where company_id=$1 and terminal_id=$2 order by valid_from desc limit 1`,
+    [companyId, terminalId],
+  );
+  assert.equal(assignment.rowCount, 1, 'the test terminal must have a location assignment');
+  const id = randomUUID();
+  await sql.query(
+    `insert into public.time_punches(
+       id,company_id,employee_id,location_id,terminal_id,terminal_assignment_id,
+       "timestamp",device_timestamp,server_timestamp,source,sync_status,clock_status,
+       result_code,boot_id,device_elapsed_ms,clock_anchor_id,recognition,payload_hash
+     ) values($1,$2,$3,$4,$5,$6,$7,$7,$7,'face','accepted','verified',null,$8,1,null,$9::jsonb,$10)`,
+    [id, companyId, targetEmployeeId, assignment.rows[0].location_id, terminalId, assignment.rows[0].id,
+      timestamp, randomUUID(), JSON.stringify({ test: 'worker-window' }), Buffer.from(randomUUID())],
+  );
+  return id;
+}
+async function insertManualPunch(companyId: string, targetEmployeeId: string, timestamp: string) {
+  const membership = await sql.query(
+    'select user_id from public.company_memberships where company_id=$1 and active order by user_id limit 1', [companyId],
+  );
+  assert.equal(membership.rowCount, 1, 'the test company must have an active administrator');
+  const id = randomUUID();
+  await sql.query(
+    `insert into public.manual_punches(id,company_id,employee_id,location_id,"timestamp",reason,actor_id)
+     values($1,$2,$3,$4,$5,'Teste de cálculo do worker',$6)`,
+    [id, companyId, targetEmployeeId, locationA, timestamp, membership.rows[0].user_id],
+  );
+  return id;
+}
 
 before(async () => {
   await sql.connect();
@@ -82,6 +122,7 @@ after(async () => {
       'public.audit_logs', 'private.attendance_recalculation_queue', 'public.bank_hours',
       'public.attendance_occurrences', 'public.attendance_calculations', 'public.work_days',
       'public.punch_adjustments',
+      'public.manual_punches',
       'public.time_punches', 'private.clock_anchors', 'private.facial_profiles',
       'private.terminal_pairings', 'public.terminal_status', 'public.employee_schedule_plans', 'public.schedule_assignments',
       'public.schedule_segments', 'public.schedule_weekdays', 'public.schedule_versions',
@@ -669,6 +710,13 @@ test('administrative punch corrections keep the original and trigger an auditabl
   assert.equal(new Date(adjustment.rows[0].original_value.timestamp).toISOString(), acceptedPunchTimestamp);
   assert.equal(new Date(adjustment.rows[0].new_value.timestamp).toISOString(), correctedTimestamp);
   assert.ok(adjustment.rows[0].actor_id);
+  const effectivePunches = await request('GET', `/v1/punches?company_id=${companyA}&employee_id=${employeeId}`, tokenA);
+  assert.equal(effectivePunches.statusCode, 200, effectivePunches.body);
+  const effectivePunch = effectivePunches.json().data.find((item: { id: string }) => item.id === created.json().id);
+  assert.ok(effectivePunch);
+  assert.equal(effectivePunch.original_time_punch_id, acceptedPunchId);
+  assert.equal(new Date(effectivePunch.timestamp).toISOString(), correctedTimestamp);
+  assert.equal(effectivePunches.json().data.some((item: { id: string }) => item.id === acceptedPunchId), false);
   const listed = await request('GET', `/v1/punch-adjustments?company_id=${companyA}`, tokenA);
   assert.equal(listed.statusCode, 200, listed.body);
   assert.equal(listed.json().data.length, 1);
@@ -767,6 +815,10 @@ test('justificativas de dia são isoladas por empresa e solicitam recálculo', a
   assert.equal(created.statusCode, 201, created.body);
   assert.equal(created.json().local_date, localDate);
 
+  const pendingFinancial = await request('GET', `/v1/financial-attendance?company_id=${companyA}&employee_id=${employeeId}&date_from=${localDate}&date_to=${localDate}`, tokenA);
+  assert.equal(pendingFinancial.statusCode, 200, pendingFinancial.body);
+  assert.equal(pendingFinancial.json().data.find((item: { date: string }) => item.date === localDate)?.financialPending, true);
+
   const forbiddenCreate = await request('POST', '/v1/day-justifications', tokenB, {
     company_id: companyA, employee_id: employeeId, local_date: '2026-09-16',
     absence_category_id: atestado.id, note: 'Tentativa cruzada',
@@ -843,6 +895,75 @@ test('justificativas de dia são isoladas por empresa e solicitam recálculo', a
   });
 });
 
+test('categorias de ausência preservam o abono das justificativas e só são excluídas sem histórico', async () => {
+  const created = await request('POST', '/v1/absence-categories', tokenA, {
+    company_id: companyA, name: `Afastamento pago ${stamp}`, abones_hours: true,
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().abones_hours, true);
+
+  const foreignCreate = await request('POST', '/v1/absence-categories', tokenB, {
+    company_id: companyA, name: `Tentativa cruzada ${stamp}`, abones_hours: false,
+  });
+  assert.equal(foreignCreate.statusCode, 403, foreignCreate.body);
+
+  const localDate = '2026-09-17';
+  const justification = await request('POST', '/v1/day-justifications', tokenA, {
+    company_id: companyA, employee_id: employeeId, local_date: localDate,
+    absence_category_id: created.json().id, note: 'Afastamento aprovado',
+  });
+  assert.equal(justification.statusCode, 201, justification.body);
+  await drainAttendanceQueue(companyA, employeeId, 'a new justification should calculate before its category changes');
+
+  const changed = await request('PATCH', `/v1/absence-categories/${created.json().id}`, tokenA, {
+    company_id: companyA, expected_version: created.json().version,
+    name: `Afastamento sem abono ${stamp}`, abones_hours: false, active: false,
+  });
+  assert.equal(changed.statusCode, 200, changed.body);
+  assert.equal(changed.json().version, created.json().version + 1);
+  assert.equal(changed.json().abones_hours, false);
+  assert.equal(changed.json().active, false);
+
+  const snapshot = await sql.query(
+    'select abones_hours from public.day_justifications where id=$1', [justification.json().id],
+  );
+  assert.equal(snapshot.rows[0].abones_hours, true);
+
+  const listed = await request('GET', `/v1/day-justifications?company_id=${companyA}&employee_id=${employeeId}&date_from=${localDate}&date_to=${localDate}`, tokenA);
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().data[0].abones_hours, true);
+
+  const financial = await request('GET', `/v1/financial-attendance?company_id=${companyA}&employee_id=${employeeId}&date_from=${localDate}&date_to=${localDate}`, tokenA);
+  assert.equal(financial.statusCode, 200, financial.body);
+  const financialRow = financial.json().data.find((item: { date: string }) => item.date === localDate);
+  assert.ok(financialRow);
+  assert.ok(financialRow.financial.justifiedCents > 0);
+
+  const cannotRemove = await request('DELETE', `/v1/absence-categories/${created.json().id}`, tokenA, {
+    company_id: companyA, expected_version: changed.json().version,
+  });
+  assert.equal(cannotRemove.statusCode, 409, cannotRemove.body);
+  assert.equal(cannotRemove.json().code, 'ABSENCE_CATEGORY_IN_USE');
+
+  const foreignUpdate = await request('PATCH', `/v1/absence-categories/${created.json().id}`, tokenB, {
+    company_id: companyA, expected_version: changed.json().version, active: true,
+  });
+  assert.equal(foreignUpdate.statusCode, 403, foreignUpdate.body);
+
+  const removedJustification = await request('DELETE', `/v1/day-justifications/${justification.json().id}`, tokenA, { company_id: companyA });
+  assert.equal(removedJustification.statusCode, 200, removedJustification.body);
+  const removedCategory = await request('DELETE', `/v1/absence-categories/${created.json().id}`, tokenA, {
+    company_id: companyA, expected_version: changed.json().version,
+  });
+  assert.equal(removedCategory.statusCode, 200, removedCategory.body);
+
+  const deletedAudit = await sql.query(
+    "select action from public.audit_logs where company_id=$1 and entity_type='absence_categories' and entity_id=$2 order by created_at desc limit 1",
+    [companyA, created.json().id],
+  );
+  assert.equal(deletedAudit.rows[0].action, 'DELETE');
+});
+
 test('worker usa datas locais no primeiro dia e na troca de escala', async () => {
   const boundaryEmployee = await request('POST', '/v1/employees', tokenA, {
     company_id: companyA, registration: `B-${stamp}`, name: 'Pessoa de Fronteira', home_location_id: locationA,
@@ -904,4 +1025,186 @@ test('worker usa datas locais no primeiro dia e na troca de escala', async () =>
     { local_date: '2026-09-01', schedule_version_id: earlyVersion, planned_minutes: 120, justified_minutes: 120 },
     { local_date: '2026-09-08', schedule_version_id: replacementVersion, planned_minutes: 360, justified_minutes: 360 },
   ]);
+});
+
+test('worker inclui a saída de um turno que atravessa a meia-noite além da janela da fila', async () => {
+  const employee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `N-${stamp}`, name: 'Pessoa do turno noturno', home_location_id: locationA,
+  });
+  assert.equal(employee.statusCode, 201, employee.body);
+  const schedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Turno noturno ${stamp}`, timezone: 'America/Fortaleza', weekdays: [1],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 0 },
+    segments: [{ ordinal: 1, start_minute: 1320, end_minute: 1560 }],
+  });
+  assert.equal(schedule.statusCode, 201, schedule.body);
+  const version = await sql.query('select id from public.schedule_versions where company_id=$1 and schedule_id=$2', [companyA, schedule.json().id]);
+  assert.equal(version.rowCount, 1);
+  const assigned = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employee.json().id, schedule_version_id: version.rows[0].id,
+    valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(assigned.statusCode, 201, assigned.body);
+
+  await insertManualPunch(companyA, employee.json().id, '2026-09-14T22:00:00-03:00');
+  await insertManualPunch(companyA, employee.json().id, '2026-09-15T02:00:00-03:00');
+  await replaceAttendanceQueue(
+    companyA, employee.json().id,
+    '2026-09-14T21:00:00-03:00',
+    '2026-09-15T00:00:00-03:00',
+  );
+  await drainAttendanceQueue(companyA, employee.json().id, 'the after-midnight exit must be included in the overnight journey');
+
+  const calculated = await sql.query(
+    `select c.state,c.worked_minutes,c.missing_minutes,c.net_balance_minutes
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-14' and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, employee.json().id],
+  );
+  assert.deepEqual(calculated.rows[0], {
+    state: 'final', worked_minutes: 240, missing_minutes: 0, net_balance_minutes: 0,
+  });
+});
+
+test('worker aplica ajustes que removem uma batida da janela e os que a movem para dentro dela', async () => {
+  const schedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Turno de ajuste ${stamp}`, timezone: 'America/Fortaleza', weekdays: [5],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 0 },
+    segments: [{ ordinal: 1, start_minute: 480, end_minute: 720 }],
+  });
+  assert.equal(schedule.statusCode, 201, schedule.body);
+  const version = await sql.query('select id from public.schedule_versions where company_id=$1 and schedule_id=$2', [companyA, schedule.json().id]);
+  assert.equal(version.rowCount, 1);
+
+  const movedOutEmployee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `AO-${stamp}`, name: 'Pessoa com ajuste para fora', home_location_id: locationA,
+  });
+  assert.equal(movedOutEmployee.statusCode, 201, movedOutEmployee.body);
+  const movedOutAssignment = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: movedOutEmployee.json().id, schedule_version_id: version.rows[0].id,
+    valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(movedOutAssignment.statusCode, 201, movedOutAssignment.body);
+  const originalEntry = await insertAcceptedPunch(companyA, movedOutEmployee.json().id, '2026-09-11T08:00:00-03:00');
+  await insertAcceptedPunch(companyA, movedOutEmployee.json().id, '2026-09-11T12:00:00-03:00');
+  const movedOut = await request('POST', `/v1/punches/${originalEntry}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: '2026-09-11T20:00:00-03:00', reason: 'Entrada conferida fora da jornada',
+  });
+  assert.equal(movedOut.statusCode, 201, movedOut.body);
+  await replaceAttendanceQueue(
+    companyA, movedOutEmployee.json().id,
+    '2026-09-11T07:00:00-03:00',
+    '2026-09-11T13:00:00-03:00',
+  );
+  await drainAttendanceQueue(companyA, movedOutEmployee.json().id, 'an adjusted original punch must not remain in its original window');
+  const movedOutCalculation = await sql.query(
+    `select c.state,c.worked_minutes
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-11'
+      order by c.revision desc limit 1`,
+    [companyA, movedOutEmployee.json().id],
+  );
+  assert.deepEqual(movedOutCalculation.rows[0], { state: 'provisional', worked_minutes: null });
+
+  const movedInEmployee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `AI-${stamp}`, name: 'Pessoa com ajuste para dentro', home_location_id: locationA,
+  });
+  assert.equal(movedInEmployee.statusCode, 201, movedInEmployee.body);
+  const movedInAssignment = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: movedInEmployee.json().id, schedule_version_id: version.rows[0].id,
+    valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(movedInAssignment.statusCode, 201, movedInAssignment.body);
+  const originalOutside = await insertAcceptedPunch(companyA, movedInEmployee.json().id, '2026-09-11T20:00:00-03:00');
+  await insertAcceptedPunch(companyA, movedInEmployee.json().id, '2026-09-11T12:00:00-03:00');
+  const movedIn = await request('POST', `/v1/punches/${originalOutside}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: '2026-09-11T08:00:00-03:00', reason: 'Entrada conferida dentro da jornada',
+  });
+  assert.equal(movedIn.statusCode, 201, movedIn.body);
+  await replaceAttendanceQueue(
+    companyA, movedInEmployee.json().id,
+    '2026-09-11T00:00:00-03:00',
+    '2026-09-11T02:00:00-03:00',
+  );
+  await drainAttendanceQueue(companyA, movedInEmployee.json().id, 'an adjustment moved into the candidate window must be counted');
+  const movedInCalculation = await sql.query(
+    `select c.state,c.worked_minutes,c.missing_minutes,c.net_balance_minutes
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-11' and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, movedInEmployee.json().id],
+  );
+  assert.deepEqual(movedInCalculation.rows[0], {
+    state: 'final', worked_minutes: 240, missing_minutes: 0, net_balance_minutes: 0,
+  });
+
+  const movedBackOut = await request('POST', `/v1/punches/${originalOutside}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: '2026-09-11T20:00:00-03:00', reason: 'Correção mais recente fora da jornada',
+  });
+  assert.equal(movedBackOut.statusCode, 201, movedBackOut.body);
+  await replaceAttendanceQueue(
+    companyA, movedInEmployee.json().id,
+    '2026-09-11T00:00:00-03:00',
+    '2026-09-11T02:00:00-03:00',
+  );
+  await drainAttendanceQueue(companyA, movedInEmployee.json().id, 'the newest adjustment must replace an older adjustment moved into the candidate window');
+  const newestAdjustmentCalculation = await sql.query(
+    `select c.state,c.worked_minutes
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-11'
+      order by c.revision desc limit 1`,
+    [companyA, movedInEmployee.json().id],
+  );
+  assert.deepEqual(newestAdjustmentCalculation.rows[0], { state: 'provisional', worked_minutes: null });
+});
+
+test('worker pagina batidas acima do limite do PostgREST sem perder as batidas da jornada', async () => {
+  const employee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `P-${stamp}`, name: 'Pessoa com histórico extenso', home_location_id: locationA,
+  });
+  assert.equal(employee.statusCode, 201, employee.body);
+  const schedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Turno paginado ${stamp}`, timezone: 'America/Fortaleza', weekdays: [1],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 0 },
+    segments: [{ ordinal: 1, start_minute: 480, end_minute: 720 }],
+  });
+  assert.equal(schedule.statusCode, 201, schedule.body);
+  const version = await sql.query('select id from public.schedule_versions where company_id=$1 and schedule_id=$2', [companyA, schedule.json().id]);
+  assert.equal(version.rowCount, 1);
+  const assignment = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employee.json().id, schedule_version_id: version.rows[0].id,
+    valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(assignment.statusCode, 201, assignment.body);
+
+  const membership = await sql.query(
+    'select user_id from public.company_memberships where company_id=$1 and active order by user_id limit 1', [companyA],
+  );
+  assert.equal(membership.rowCount, 1);
+  await sql.query(
+    `insert into public.manual_punches(company_id,employee_id,location_id,"timestamp",reason,actor_id)
+     select $1,$2,$3,$4::timestamptz + (series * interval '1 microsecond'),'Evento fora da jornada',$5
+       from generate_series(1,1000) as series`,
+    [companyA, employee.json().id, locationA, '2026-09-13T12:00:00-03:00', membership.rows[0].user_id],
+  );
+  await insertManualPunch(companyA, employee.json().id, '2026-09-14T08:00:00-03:00');
+  await insertManualPunch(companyA, employee.json().id, '2026-09-14T12:00:00-03:00');
+  await replaceAttendanceQueue(
+    companyA, employee.json().id,
+    '2026-09-13T00:00:00-03:00',
+    '2026-09-14T13:00:00-03:00',
+  );
+  await drainAttendanceQueue(companyA, employee.json().id, 'the worker must read the second page containing the valid punches');
+
+  const calculated = await sql.query(
+    `select c.state,c.worked_minutes,c.missing_minutes,c.net_balance_minutes
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-14' and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, employee.json().id],
+  );
+  assert.deepEqual(calculated.rows[0], {
+    state: 'final', worked_minutes: 240, missing_minutes: 0, net_balance_minutes: 0,
+  });
 });

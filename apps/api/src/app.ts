@@ -83,6 +83,17 @@ const attendanceQuery = z.object({
 }).strict().refine((value) => !value.date_from || !value.date_to || value.date_to >= value.date_from);
 const attendanceReportQuery = attendanceQuery.extend({ format: z.enum(['xlsx', 'pdf']) });
 const absenceCategoriesQuery = z.object({ company_id: z.uuid(), active: z.stringbool().optional() }).strict();
+const absenceCategoryBody = z.object({
+  company_id: z.uuid(), name: z.string().trim().min(1).max(120), abones_hours: z.boolean(),
+}).strict();
+const absenceCategoryParams = z.object({ id: z.uuid() }).strict();
+const absenceCategoryUpdateBody = z.object({
+  company_id: z.uuid(), expected_version: z.number().int().positive(), name: z.string().trim().min(1).max(120).optional(),
+  abones_hours: z.boolean().optional(), active: z.boolean().optional(),
+}).strict().refine((value) => value.name !== undefined || value.abones_hours !== undefined || value.active !== undefined);
+const deleteAbsenceCategoryBody = z.object({
+  company_id: z.uuid(), expected_version: z.number().int().positive(),
+}).strict();
 const dayJustificationsQuery = z.object({
   company_id: z.uuid(), employee_id: z.uuid().optional(), date_from: z.iso.date().optional(), date_to: z.iso.date().optional(),
 }).strict().refine((value) => !value.date_from || !value.date_to || value.date_to >= value.date_from);
@@ -178,6 +189,7 @@ function mapDatabaseError(reply: FastifyReply, request: FastifyRequest, dbError:
   if (dbError.code === '23505') return error(reply, 409, 'CONFLICT', 'Já existe um registro com estes dados.', request.id);
   if (dbError.code === '40001') return error(reply, 409, 'VERSION_CONFLICT', 'O registro foi alterado ou não está disponível.', request.id);
   if (dbError.code === 'P0001' && dbError.message.includes('FACIAL_PROFILE_ALREADY_PREPARED')) return error(reply, 409, 'FACIAL_PROFILE_ALREADY_PREPARED', 'O reconhecimento facial deste funcionário já está preparado.', request.id);
+  if (dbError.code === 'P0001' && dbError.message.includes('ABSENCE_CATEGORY_IN_USE')) return error(reply, 409, 'ABSENCE_CATEGORY_IN_USE', 'Esta categoria já possui justificativas e não pode ser removida.', request.id);
   if (dbError.code === '23503' || dbError.code === '23514' || dbError.code === '23P01') {
     return error(reply, 422, 'INVALID_REFERENCE', 'Os dados informados não são válidos.', request.id);
   }
@@ -197,7 +209,7 @@ type PaymentSettings = Partial<Record<PaymentRateKey, number | null>>;
 type ReportCalculation = {
   state: string; revision: number; planned_minutes: number; worked_minutes: number | null; regular_minutes: number | null;
   justified_minutes: number | null; missing_minutes: number | null; gross_overtime_minutes: number | null;
-  net_balance_minutes: number | null;
+  net_balance_minutes: number | null; calculated_at: string;
 };
 type ReportWorkDay = { employee_id: string; local_date: string; attendance_calculations: ReportCalculation[] | null };
 type ReportEmployee = { id: string; name: string; registration: string; department_id: string | null };
@@ -205,8 +217,8 @@ type PaymentDay = {
   employee_id: string; local_date: string; meal_units: number; dinner_units: number; daily_allowance_units: number;
   night_shift_units: number; saturday_units: number; serao_units: number;
 };
-type AbsenceCategory = { name: string; abones_hours: boolean };
-type DayJustification = { employee_id: string; local_date: string; absence_categories: AbsenceCategory | AbsenceCategory[] | null };
+type AbsenceCategory = { name: string; abones_hours?: boolean };
+type DayJustification = { employee_id: string; local_date: string; abones_hours: boolean; updated_at: string; absence_categories: AbsenceCategory | AbsenceCategory[] | null };
 type AllowanceKey = 'meal' | 'dinner' | 'daily_allowance' | 'night_shift' | 'saturday' | 'serao';
 type DailyFinancials = {
   regularCents: number; justifiedCents: number; overtimeCents: number; shortageCents: number; allowanceCents: number;
@@ -238,7 +250,8 @@ function currentCalculation(calculations: ReportCalculation[] | null | undefined
 
 function absenceCategory(justification: DayJustification | undefined) {
   const categories = justification?.absence_categories;
-  return Array.isArray(categories) ? categories[0] ?? null : categories ?? null;
+  const category = Array.isArray(categories) ? categories[0] ?? null : categories ?? null;
+  return category ? { name: category.name, abones_hours: justification!.abones_hours } : null;
 }
 
 function resolvedRates(
@@ -278,7 +291,7 @@ async function buildFinancialAttendance(
   db: AuthContext['db'], userId: string, query: z.infer<typeof attendanceQuery>,
 ): Promise<FinancialAttendanceBuildResult> {
   let daysRequest = db.from('work_days')
-    .select('employee_id,local_date,attendance_calculations(state,revision,planned_minutes,worked_minutes,regular_minutes,justified_minutes,missing_minutes,gross_overtime_minutes,net_balance_minutes)')
+    .select('employee_id,local_date,attendance_calculations(state,revision,planned_minutes,worked_minutes,regular_minutes,justified_minutes,missing_minutes,gross_overtime_minutes,net_balance_minutes,calculated_at)')
     .eq('company_id', query.company_id).order('local_date', { ascending: true }).order('employee_id', { ascending: true });
   let employeesRequest = db.from('employees').select('id,name,registration,department_id')
     .eq('company_id', query.company_id).order('name').order('id');
@@ -288,7 +301,7 @@ async function buildFinancialAttendance(
     .select('employee_id,local_date,meal_units,dinner_units,daily_allowance_units,night_shift_units,saturday_units,serao_units')
     .eq('company_id', query.company_id).order('local_date', { ascending: true }).order('employee_id');
   let justificationsRequest = db.from('day_justifications')
-    .select('employee_id,local_date,absence_categories(name,abones_hours)')
+    .select('employee_id,local_date,abones_hours,updated_at,absence_categories(name)')
     .eq('company_id', query.company_id).order('local_date', { ascending: true }).order('employee_id');
   if (query.employee_id) {
     daysRequest = daysRequest.eq('employee_id', query.employee_id);
@@ -346,9 +359,12 @@ async function buildFinancialAttendance(
     if (!employee || !date) return [];
     const calculation = currentCalculation(day?.attendance_calculations);
     const rates = resolvedRates(employeeRatesByEmployee.get(employee.id), departmentRatesByDepartment.get(employee.department_id ?? ''), companyRates);
-    const financialPending = calculation?.state === 'provisional';
+    const justificationChangedAfterCalculation = Boolean(
+      justification && (!calculation || !calculation.calculated_at || Date.parse(justification.updated_at) > Date.parse(calculation.calculated_at)),
+    );
+    const financialPending = calculation?.state === 'provisional' || justificationChangedAfterCalculation;
     const financial = resolveDailyFinancials({
-      calculation: calculation?.state === 'final' ? calculation : {}, rates,
+      calculation: calculation?.state === 'final' && !financialPending ? calculation : {}, rates,
       additions: paymentDay ?? {}, justification: absenceCategory(justification),
     }) as DailyFinancials;
     return [{
@@ -836,6 +852,10 @@ export function buildApp(config: ApiConfig) {
   });
   app.get('/v1/punches', async (request, reply) => {
     const query = punchesQuery.parse(request.query);
+    type Relation = { name?: string; registration?: string };
+    type RawPunch = Record<string, unknown> & { id: string; employee_id: string; location_id: string; timestamp: string; source: string; sync_status: string; clock_status: string; punch_type: string; employees?: Relation | Relation[]; locations?: Relation | Relation[] };
+    type Adjustment = { id: string; original_time_punch_id: string; corrected_timestamp: string; reason: string; created_at: string };
+    const punchFields = 'id,employee_id,company_id,location_id,terminal_id,timestamp,device_timestamp,server_timestamp,punch_type,source,sync_status,clock_status,result_code,created_at,employees(name,registration),locations(name)';
     let builder = request.auth!.db.from('time_punches').select('id,employee_id,company_id,location_id,terminal_id,timestamp,device_timestamp,server_timestamp,punch_type,source,sync_status,clock_status,result_code,created_at,employees(name,registration),locations(name)')
       .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
@@ -844,6 +864,57 @@ export function buildApp(config: ApiConfig) {
     if (query.punch_to) builder = builder.lt('timestamp', query.punch_to);
     const { data, error: dbError } = await builder;
     if (dbError) return mapDatabaseError(reply, request, dbError);
+    const rawPunches = (data ?? []) as unknown as RawPunch[];
+
+    // A correction is a new audit record rather than a mutation of the raw
+    // event.  Pull corrections that enter the requested period as well, then
+    // use the newest correction for each original event in the screen model.
+    let movedBuilder = request.auth!.db.from('punch_adjustments')
+      .select('id,original_time_punch_id,corrected_timestamp,reason,created_at')
+      .eq('company_id', query.company_id).order('created_at', { ascending: false }).order('id', { ascending: false }).limit(1_000);
+    if (query.employee_id) movedBuilder = movedBuilder.eq('employee_id', query.employee_id);
+    if (query.punch_from) movedBuilder = movedBuilder.gte('corrected_timestamp', query.punch_from);
+    if (query.punch_to) movedBuilder = movedBuilder.lt('corrected_timestamp', query.punch_to);
+    const { data: movedData, error: movedError } = await movedBuilder;
+    if (movedError) return mapDatabaseError(reply, request, movedError);
+    const movedAdjustments = (movedData ?? []) as unknown as Adjustment[];
+
+    const rawById = new Map(rawPunches.map((item) => [item.id, item]));
+    const movedOriginalIds = [...new Set(movedAdjustments.map((item) => item.original_time_punch_id).filter((id) => !rawById.has(id)))];
+    for (let offset = 0; offset < movedOriginalIds.length; offset += 200) {
+      let originalBuilder = request.auth!.db.from('time_punches').select(punchFields).eq('company_id', query.company_id).in('id', movedOriginalIds.slice(offset, offset + 200));
+      if (query.employee_id) originalBuilder = originalBuilder.eq('employee_id', query.employee_id);
+      if (query.location_id) originalBuilder = originalBuilder.eq('location_id', query.location_id);
+      const { data: originals, error: originalError } = await originalBuilder;
+      if (originalError) return mapDatabaseError(reply, request, originalError);
+      for (const original of (originals ?? []) as unknown as RawPunch[]) rawById.set(original.id, original);
+    }
+
+    const adjustments: Adjustment[] = [];
+    const originalIds = [...rawById.keys()];
+    for (let offset = 0; offset < originalIds.length; offset += 200) {
+      let adjustmentBuilder = request.auth!.db.from('punch_adjustments')
+        .select('id,original_time_punch_id,corrected_timestamp,reason,created_at')
+        .eq('company_id', query.company_id).in('original_time_punch_id', originalIds.slice(offset, offset + 200))
+        .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(1_000);
+      if (query.employee_id) adjustmentBuilder = adjustmentBuilder.eq('employee_id', query.employee_id);
+      const { data: adjustmentData, error: adjustmentError } = await adjustmentBuilder;
+      if (adjustmentError) return mapDatabaseError(reply, request, adjustmentError);
+      adjustments.push(...(adjustmentData ?? []) as unknown as Adjustment[]);
+    }
+    const latestAdjustmentByOriginal = new Map<string, Adjustment>();
+    for (const adjustment of [...adjustments, ...movedAdjustments].sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id))) {
+      if (!latestAdjustmentByOriginal.has(adjustment.original_time_punch_id)) latestAdjustmentByOriginal.set(adjustment.original_time_punch_id, adjustment);
+    }
+    const inRequestedPeriod = (timestamp: string) => (!query.punch_from || timestamp >= query.punch_from) && (!query.punch_to || timestamp < query.punch_to);
+    const projectedPunches = [...rawById.values()].flatMap((punch) => {
+      const adjustment = latestAdjustmentByOriginal.get(punch.id);
+      const timestamp = adjustment?.corrected_timestamp ?? punch.timestamp;
+      if (!inRequestedPeriod(timestamp)) return [];
+      const employee = Array.isArray(punch.employees) ? punch.employees[0] : punch.employees;
+      const location = Array.isArray(punch.locations) ? punch.locations[0] : punch.locations;
+      return [{ ...punch, id: adjustment?.id ?? punch.id, timestamp, original_time_punch_id: adjustment?.original_time_punch_id, original_timestamp: adjustment ? punch.timestamp : undefined, reason: adjustment?.reason, location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null }];
+    });
     let manualBuilder = request.auth!.db.from('manual_punches').select('id,employee_id,company_id,location_id,timestamp,reason,created_at,employees(name,registration),locations(name)')
       .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
     if (query.employee_id) manualBuilder = manualBuilder.eq('employee_id', query.employee_id);
@@ -852,17 +923,12 @@ export function buildApp(config: ApiConfig) {
     if (query.punch_to) manualBuilder = manualBuilder.lt('timestamp', query.punch_to);
     const { data: manualData, error: manualError } = await manualBuilder;
     if (manualError) return mapDatabaseError(reply, request, manualError);
-    const namedPunches = (data ?? []).map(({ employees, locations, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }>; locations?: { name?: string } | Array<{ name?: string }> } & Record<string, unknown>) => {
-      const employee = Array.isArray(employees) ? employees[0] : employees;
-      const location = Array.isArray(locations) ? locations[0] : locations;
-      return { ...punch, location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
-    });
     const namedManualPunches = (manualData ?? []).map(({ employees, locations, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }>; locations?: { name?: string } | Array<{ name?: string }> } & Record<string, unknown>) => {
       const employee = Array.isArray(employees) ? employees[0] : employees;
       const location = Array.isArray(locations) ? locations[0] : locations;
       return { ...punch, source: 'manual', punch_type: 'unclassified', sync_status: 'accepted', clock_status: 'verified', location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
     });
-    const allPunches = [...namedPunches, ...namedManualPunches] as unknown as Array<Record<string, unknown> & { timestamp: string }>;
+    const allPunches = [...projectedPunches, ...namedManualPunches] as unknown as Array<Record<string, unknown> & { timestamp: string }>;
     return { data: allPunches.sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, 200) };
   });
   app.post('/v1/punches/:id/adjustments', async (request, reply) => {
@@ -902,10 +968,41 @@ export function buildApp(config: ApiConfig) {
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return { data };
   });
+  app.post('/v1/absence-categories', async (request, reply) => {
+    const body = absenceCategoryBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('create_absence_category', {
+      p_company: body.company_id, p_name: body.name, p_abones_hours: body.abones_hours,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
+  });
+  app.patch('/v1/absence-categories/:id', async (request, reply) => {
+    const params = absenceCategoryParams.parse(request.params);
+    const body = absenceCategoryUpdateBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('update_absence_category', {
+      p_company: body.company_id,
+      p_category: params.id,
+      p_expected_version: body.expected_version,
+      p_name: body.name ?? null,
+      p_abones_hours: body.abones_hours ?? null,
+      p_active: body.active ?? null,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return data;
+  });
+  app.delete('/v1/absence-categories/:id', async (request, reply) => {
+    const params = absenceCategoryParams.parse(request.params);
+    const body = deleteAbsenceCategoryBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('delete_absence_category', {
+      p_company: body.company_id, p_category: params.id, p_expected_version: body.expected_version,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return data;
+  });
   app.get('/v1/day-justifications', async (request, reply) => {
     const query = dayJustificationsQuery.parse(request.query);
     let builder = request.auth!.db.from('day_justifications')
-      .select('id,company_id,employee_id,local_date,absence_category_id,note,version,created_at,updated_at,absence_categories(id,name,abones_hours,active)')
+      .select('id,company_id,employee_id,local_date,absence_category_id,abones_hours,note,version,created_at,updated_at,absence_categories(id,name,abones_hours,active)')
       .eq('company_id', query.company_id).order('local_date', { ascending: false }).limit(500);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
     if (query.date_from) builder = builder.gte('local_date', query.date_from);
