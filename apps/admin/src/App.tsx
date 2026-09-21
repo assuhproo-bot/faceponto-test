@@ -1,19 +1,31 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { createClient, type Session } from '@supabase/supabase-js';
 import lugaLogo from './luga-logo.jpg';
-import { api, ApiError, type BankEntry, type CompanyPaymentSettings, type Employee, type EmployeeLocation, type EmployeePaymentDay, type EmployeePaymentSettings, type EmployeeRegistrationRequest, type EmployeeSchedulePlan, type FacialProfileStatus, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
+import { api, ApiError, type BankEntry, type Department, type Employee, type EmployeeLocation, type EmployeeRegistrationRequest, type EmployeeSchedulePlan, type FacialProfileStatus, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
+import { Timesheet, TimesheetFilters } from './timesheet.js';
+import { AbsenceCategoryManagement, DepartmentManagement, EmployeeManagement, PaymentManagement } from './management.js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
 const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined;
 const supabase = supabaseUrl && publishableKey ? createClient(supabaseUrl, publishableKey) : null;
 const pendingCompanyKey = 'faceponto.pending-company';
+const dashboardRecentDays = 30;
 
-type DashboardData = {
+type DashboardData = Partial<{
   days: WorkDay[]; occurrences: Occurrence[]; bank: BankEntry[]; balance: number; punches: Punch[]; adjustments: PunchAdjustment[];
   employees: Employee[]; locations: Location[]; employeeLocations: EmployeeLocation[]; registrationRequests: EmployeeRegistrationRequest[];
   facialProfiles: FacialProfileStatus[]; schedules: Schedule[]; scheduleAssignments: ScheduleAssignmentRecord[]; dailyPlans: EmployeeSchedulePlan[]; terminals: Terminal[];
-};
+  departments: Department[];
+}>;
+type DashboardState = { companyId: string; data: DashboardData };
+
+function recentDateRange(days = dashboardRecentDays) {
+  const to = fortalezaDate(new Date().toISOString());
+  const start = new Date(`${to}T12:00:00-03:00`);
+  start.setUTCDate(start.getUTCDate() - (days - 1));
+  return { from: start.toISOString().slice(0, 10), to };
+}
 
 function minutes(value: number | null | undefined) {
   if (value == null) return '—';
@@ -22,10 +34,12 @@ function minutes(value: number | null | undefined) {
   return `${sign}${Math.floor(absolute / 60)}h${String(absolute % 60).padStart(2, '0')}`;
 }
 function dateTime(value: string) { return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)); }
-function inputDate(value: Date) { return value.toISOString().slice(0, 10); }
 function localDayStart(value: string) { return new Date(`${value}T00:00:00`).toISOString(); }
 function localDayAfter(value: string) { const date = new Date(`${value}T00:00:00`); date.setDate(date.getDate() + 1); return date.toISOString(); }
-function currentCalculation(day: WorkDay) { return day.attendance_calculations.find((item) => item.state !== 'superseded') ?? day.attendance_calculations[0]; }
+function currentCalculation(day: WorkDay) {
+  const latest = (values: WorkDay['attendance_calculations']) => values.reduce<WorkDay['attendance_calculations'][number] | undefined>((current, item) => !current || item.revision > current.revision ? item : current, undefined);
+  return latest(day.attendance_calculations.filter((item) => item.state !== 'superseded')) ?? latest(day.attendance_calculations);
+}
 function fortalezaDate(value: string) { const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Fortaleza', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(value)); const part = (type: string) => parts.find((item) => item.type === type)?.value ?? ''; return `${part('year')}-${part('month')}-${part('day')}`; }
 function fortalezaTime(value: string) { return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Fortaleza', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value)); }
 function dayLabel(value: string) { return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Fortaleza', weekday: 'short', day: '2-digit', month: '2-digit' }).format(new Date(`${value}T12:00:00-03:00`)); }
@@ -110,11 +124,16 @@ function Access() {
 
 function Dashboard({ session, onLogout }: { session: Session; onLogout: () => void }) {
   const [me, setMe] = useState<Me | null>(null); const [companyId, setCompanyId] = useState('');
-  const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [data, setData] = useState<DashboardData | null>(null);
-  const [employeeId, setEmployeeId] = useState(''); const [locationId, setLocationId] = useState(''); const [activeTab, setActiveTab] = useState<'overview' | 'timesheet' | 'people' | 'terminals' | 'schedules' | 'settings'>('overview');
-  const [error, setError] = useState(''); const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0);
+  const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [dashboard, setDashboard] = useState<DashboardState | null>(null);
+  const [employeeId, setEmployeeId] = useState(''); const [locationId, setLocationId] = useState(''); const [activeTab, setActiveTab] = useState<'overview' | 'timesheet' | 'payments' | 'people' | 'terminals' | 'schedules' | 'settings'>('overview');
+  const [error, setError] = useState(''); const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0); const [timesheetRefresh, setTimesheetRefresh] = useState(0); const [timesheetDataKey, setTimesheetDataKey] = useState('');
   const [registrationDraft, setRegistrationDraft] = useState<EmployeeRegistrationRequest | null>(null);
   const [accountRefresh, setAccountRefresh] = useState(0); const [bootstrapAttempted, setBootstrapAttempted] = useState(false);
+  const mergeDashboardData = useCallback((requestCompanyId: string, values: DashboardData) => {
+    setDashboard((current) => current?.companyId === requestCompanyId
+      ? { companyId: requestCompanyId, data: { ...current.data, ...values } }
+      : { companyId: requestCompanyId, data: values });
+  }, []);
   useEffect(() => { void api<Me>('/v1/me', session.access_token).then((value) => {
     setMe(value); setCompanyId((previous) => previous || value.memberships[0]?.company_id || '');
   }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Não foi possível carregar a conta.')); }, [session.access_token, accountRefresh]);
@@ -138,66 +157,132 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
     }
   }, [bootstrapAttempted, me, session.access_token]);
   useEffect(() => {
+    if (activeTab !== 'overview') return;
     const timer = window.setInterval(() => setRefresh((value) => value + 1), 20_000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [activeTab]);
   useEffect(() => {
-    if (!companyId) { setLoading(false); return; }
+    if (!companyId) { setDashboard(null); setLoading(false); return; }
     let active = true; setLoading(true); setError('');
-    const query = { company_id: companyId, date_from: from || undefined, date_to: to || undefined };
-    void Promise.all([
-      api<{ data: WorkDay[] }>(withQuery('/v1/attendance', { ...query, employee_id: employeeId || undefined }), session.access_token),
-      api<{ data: Occurrence[] }>(withQuery('/v1/occurrences', { company_id: companyId, employee_id: employeeId || undefined }), session.access_token),
-      api<{ data: BankEntry[]; balance_minutes: number }>(withQuery('/v1/bank-hours', { ...query, employee_id: employeeId || undefined }), session.access_token),
-      api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId, employee_id: employeeId || undefined, location_id: locationId || undefined, punch_from: from ? localDayStart(from) : undefined, punch_to: to ? localDayAfter(to) : undefined }), session.access_token),
-      api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId, employee_id: employeeId || undefined }), session.access_token),
-      api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
-      api<{ data: FacialProfileStatus[] }>(withQuery('/v1/facial-profiles', { company_id: companyId }), session.access_token),
-      api<{ data: EmployeeLocation[] }>(withQuery('/v1/employee-locations', { company_id: companyId }), session.access_token),
-      api<{ data: EmployeeRegistrationRequest[] }>(withQuery('/v1/employee-registration-requests', { company_id: companyId }), session.access_token),
-      api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
-      api<{ data: Schedule[] }>(withQuery('/v1/schedules', { company_id: companyId }), session.access_token),
-      api<{ data: ScheduleAssignmentRecord[] }>(withQuery('/v1/schedule-assignments', { company_id: companyId }), session.access_token),
-      api<{ data: EmployeeSchedulePlan[] }>(withQuery('/v1/employee-schedule-plans', { company_id: companyId }), session.access_token),
-      api<{ data: Terminal[] }>(withQuery('/v1/terminals', { company_id: companyId }), session.access_token),
-    ]).then(([attendance, occurrences, bank, punches, adjustments, employees, facialProfiles, employeeLocations, registrationRequests, locations, schedules, scheduleAssignments, dailyPlans, terminals]) => {
-      if (active) setData({ days: attendance.data, occurrences: occurrences.data, bank: bank.data, balance: bank.balance_minutes, punches: punches.data, adjustments: adjustments.data, employees: employees.data, facialProfiles: facialProfiles.data, employeeLocations: employeeLocations.data, registrationRequests: registrationRequests.data, locations: locations.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data, terminals: terminals.data });
-    }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar os dados.'); })
+    async function load() {
+      if (activeTab === 'overview') {
+        const period = recentDateRange(); const query = { company_id: companyId, date_from: period.from, date_to: period.to };
+        const [attendance, occurrences, bank, punches, employees, locations, terminals, schedules] = await Promise.all([
+          api<{ data: WorkDay[] }>(withQuery('/v1/attendance', query), session.access_token),
+          api<{ data: Occurrence[] }>(withQuery('/v1/occurrences', { company_id: companyId }), session.access_token),
+          api<{ data: BankEntry[]; balance_minutes: number }>(withQuery('/v1/bank-hours', query), session.access_token),
+          api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId, punch_from: localDayStart(period.from), punch_to: localDayAfter(period.to) }), session.access_token),
+          api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
+          api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
+          api<{ data: Terminal[] }>(withQuery('/v1/terminals', { company_id: companyId }), session.access_token),
+          api<{ data: Schedule[] }>(withQuery('/v1/schedules', { company_id: companyId }), session.access_token),
+        ]);
+        if (active) mergeDashboardData(companyId, { days: attendance.data, occurrences: occurrences.data, bank: bank.data, balance: bank.balance_minutes, punches: punches.data, employees: employees.data, locations: locations.data, terminals: terminals.data, schedules: schedules.data });
+        return;
+      }
+      if (activeTab === 'timesheet') {
+        const [employees, locations] = await Promise.all([
+          api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
+          api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
+        ]);
+        if (active) mergeDashboardData(companyId, { employees: employees.data, locations: locations.data });
+        return;
+      }
+      if (activeTab === 'payments') {
+        const [employees, departments] = await Promise.all([
+          api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
+          api<{ data: Department[] }>(withQuery('/v1/departments', { company_id: companyId }), session.access_token),
+        ]);
+        if (active) mergeDashboardData(companyId, { employees: employees.data, departments: departments.data });
+        return;
+      }
+      if (activeTab === 'people') {
+        const [registrationRequests, employees, facialProfiles, employeeLocations, locations, departments] = await Promise.all([
+          api<{ data: EmployeeRegistrationRequest[] }>(withQuery('/v1/employee-registration-requests', { company_id: companyId }), session.access_token),
+          api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
+          api<{ data: FacialProfileStatus[] }>(withQuery('/v1/facial-profiles', { company_id: companyId }), session.access_token),
+          api<{ data: EmployeeLocation[] }>(withQuery('/v1/employee-locations', { company_id: companyId }), session.access_token),
+          api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
+          api<{ data: Department[] }>(withQuery('/v1/departments', { company_id: companyId }), session.access_token),
+        ]);
+        if (active) mergeDashboardData(companyId, { registrationRequests: registrationRequests.data, employees: employees.data, facialProfiles: facialProfiles.data, employeeLocations: employeeLocations.data, locations: locations.data, departments: departments.data });
+        return;
+      }
+      if (activeTab === 'terminals') {
+        const [locations, terminals] = await Promise.all([
+          api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
+          api<{ data: Terminal[] }>(withQuery('/v1/terminals', { company_id: companyId }), session.access_token),
+        ]);
+        if (active) mergeDashboardData(companyId, { locations: locations.data, terminals: terminals.data });
+        return;
+      }
+      if (activeTab === 'schedules') {
+        const [employees, schedules, scheduleAssignments, dailyPlans] = await Promise.all([
+          api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
+          api<{ data: Schedule[] }>(withQuery('/v1/schedules', { company_id: companyId }), session.access_token),
+          api<{ data: ScheduleAssignmentRecord[] }>(withQuery('/v1/schedule-assignments', { company_id: companyId }), session.access_token),
+          api<{ data: EmployeeSchedulePlan[] }>(withQuery('/v1/employee-schedule-plans', { company_id: companyId }), session.access_token),
+        ]);
+        if (active) mergeDashboardData(companyId, { employees: employees.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data });
+        return;
+      }
+      const period = recentDateRange();
+      const [departments, employees, locations, adjustments, punches] = await Promise.all([
+        api<{ data: Department[] }>(withQuery('/v1/departments', { company_id: companyId }), session.access_token),
+        api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
+        api<{ data: Location[] }>(withQuery('/v1/locations', { company_id: companyId }), session.access_token),
+        api<{ data: PunchAdjustment[] }>(withQuery('/v1/punch-adjustments', { company_id: companyId }), session.access_token),
+        api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId, punch_from: localDayStart(period.from), punch_to: localDayAfter(period.to) }), session.access_token),
+      ]);
+      if (active) mergeDashboardData(companyId, { departments: departments.data, employees: employees.data, locations: locations.data, adjustments: adjustments.data, punches: punches.data });
+    }
+    void load().catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar os dados.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [session.access_token, companyId, employeeId, locationId, from, to, refresh]);
+  }, [activeTab, companyId, mergeDashboardData, refresh, session.access_token]);
+  const timesheetQueryKey = [companyId, employeeId, from, to, refresh, timesheetRefresh].join('|');
+  const canLoadTimesheet = Boolean(employeeId && from && to);
+  useEffect(() => {
+    if (activeTab !== 'timesheet' || !companyId || !canLoadTimesheet) { setTimesheetDataKey(''); return; }
+    let active = true; setLoading(true); setError(''); setTimesheetDataKey('');
+    const query = { company_id: companyId, employee_id: employeeId, date_from: from || undefined, date_to: to || undefined };
+    void Promise.all([
+      api<{ data: WorkDay[] }>(withQuery('/v1/attendance', query), session.access_token),
+      api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId, employee_id: employeeId, punch_from: from ? localDayStart(from) : undefined, punch_to: to ? localDayAfter(to) : undefined }), session.access_token),
+    ]).then(([attendance, punches]) => {
+      if (!active) return;
+      mergeDashboardData(companyId, { days: attendance.data, punches: punches.data }); setTimesheetDataKey(timesheetQueryKey);
+    }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar a apuração.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [activeTab, canLoadTimesheet, companyId, employeeId, from, mergeDashboardData, refresh, session.access_token, timesheetQueryKey, to]);
+  useEffect(() => { setRegistrationDraft(null); setTimesheetDataKey(''); }, [companyId]);
+  const data = dashboard?.companyId === companyId ? dashboard.data : null;
   const selectedCompany = useMemo(() => me?.memberships.find((item) => item.company_id === companyId)?.companies, [companyId, me]);
-  const openOccurrences = data?.occurrences.filter((item) => item.status === 'open').length ?? 0;
-  function setPeriod(period: 'today' | 'week' | 'month' | 'all') {
-    if (period === 'all') { setFrom(''); setTo(''); return; }
-    const now = new Date(); const start = new Date(now);
-    if (period === 'week') start.setDate(now.getDate() - ((now.getDay() + 6) % 7));
-    if (period === 'month') start.setDate(1);
-    setFrom(inputDate(start)); setTo(inputDate(now));
-  }
+  const openOccurrences = data?.occurrences?.filter((item) => item.status === 'open').length ?? 0;
+  if (companyId && !data && loading) return <main className="centered">Carregando painel…</main>;
   if (loading && !data) return <main className="centered">Carregando painel…</main>;
   return <main className="shell"><header className="app-header"><div className="brand"><img src={lugaLogo} alt="Luga Transportes" /><div><p className="eyebrow">PONTÍFICELUGA</p><h1>{selectedCompany?.name ?? 'Painel administrativo'}</h1></div></div>
     <div className="header-actions"><button className="secondary" onClick={() => setRefresh((value) => value + 1)}>Atualizar</button><button className="secondary" onClick={onLogout}>Sair</button></div></header>
     {error && <p className="notice error">{error}</p>}
     {!me?.memberships.length ? <p className="notice">Esta conta ainda não possui uma empresa. Crie uma conta nova para iniciar uma empresa local.</p> : <>
-      <section className="filters" aria-label="Filtros"><label>Empresa<select value={companyId} onChange={(event) => { setCompanyId(event.target.value); setEmployeeId(''); setLocationId(''); }}>{me.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label>
-        <label>Funcionário<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Todos</option>{(data?.employees ?? []).filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-        <label>Local<select value={locationId} onChange={(event) => setLocationId(event.target.value)}><option value="">Todos</option>{(data?.locations ?? []).filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-        <label>De<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>Até<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label><div className="report-actions"><button type="button" className="secondary" onClick={() => setPeriod('today')}>Hoje</button><button type="button" className="secondary" onClick={() => setPeriod('week')}>Esta semana</button><button type="button" className="secondary" onClick={() => setPeriod('month')}>Este mês</button><button type="button" className="secondary" onClick={() => setPeriod('all')}>Limpar período</button><button type="button" onClick={() => setRefresh((value) => value + 1)}>Buscar apuração</button></div><p className="filter-help">Escolha o funcionário e o período. O mesmo filtro será usado no espelho de ponto e nos arquivos PDF e XLSX.</p></section>
+      <section className="company-switcher" aria-label="Empresa"><label>Empresa<select value={companyId} onChange={(event) => { setCompanyId(event.target.value); setDashboard(null); setLoading(true); setError(''); setEmployeeId(''); setLocationId(''); setRegistrationDraft(null); setTimesheetDataKey(''); }}>{me.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label></section>
       <nav className="app-tabs" aria-label="Áreas do painel">
         <button className={activeTab === 'overview' ? 'active' : 'secondary'} onClick={() => setActiveTab('overview')}>Visão geral</button>
         <button className={activeTab === 'timesheet' ? 'active' : 'secondary'} onClick={() => setActiveTab('timesheet')}>Apuração</button>
-        <button className={activeTab === 'people' ? 'active' : 'secondary'} onClick={() => setActiveTab('people')}>Pessoas</button>
-        <button className={activeTab === 'terminals' ? 'active' : 'secondary'} onClick={() => setActiveTab('terminals')}>Terminais</button>
+        <button className={activeTab === 'payments' ? 'active' : 'secondary'} onClick={() => setActiveTab('payments')}>Pagamentos</button>
+        <button className={activeTab === 'people' ? 'active' : 'secondary'} onClick={() => setActiveTab('people')}>Funcionários</button>
+        <button className={activeTab === 'terminals' ? 'active' : 'secondary'} onClick={() => setActiveTab('terminals')}>Terminais e locais</button>
         <button className={activeTab === 'schedules' ? 'active' : 'secondary'} onClick={() => setActiveTab('schedules')}>Escalas</button>
         <button className={activeTab === 'settings' ? 'active' : 'secondary'} onClick={() => setActiveTab('settings')}>Configurações</button>
       </nav>
-      {activeTab === 'overview' && <><SetupGuide companyId={companyId} locations={data?.locations ?? []} employees={data?.employees ?? []} terminals={data?.terminals ?? []} schedules={data?.schedules ?? []} /><section className="metrics"><Metric label="Jornadas" value={String(data?.days.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label="Saldo no período" value={minutes(data?.balance)} /></section><RecentPunches values={data?.punches ?? []} days={data?.days ?? []} /><section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section></>}
-      {activeTab === 'timesheet' && (employeeId ? <Timesheet employee={data?.employees.find((item) => item.id === employeeId)} punches={data?.punches ?? []} days={data?.days ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} selectedLocationId={locationId} from={from} to={to} onSaved={() => setRefresh((value) => value + 1)} /> : <p className="notice">Escolha um funcionário e o período acima para abrir a apuração.</p>)}
-      {activeTab === 'people' && <><RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onUseForRegistration={setRegistrationDraft} onSaved={() => setRefresh((value) => value + 1)} /><section className="grid employees-grid"><Employees values={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeForm companyId={companyId} locations={data?.locations ?? []} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /></section><FacialProfileProvisioning employees={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
-      {activeTab === 'terminals' && <Terminals values={data?.terminals ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} />}
-      {activeTab === 'schedules' && <><section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section><ScheduleAssignment companyId={companyId} employees={data?.employees ?? []} schedules={data?.schedules ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><DailySchedulePlans values={data?.dailyPlans ?? []} employees={data?.employees ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><ScheduleAssignments values={data?.scheduleAssignments ?? []} employees={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
-      {activeTab === 'settings' && <><CompanyPaymentSettingsForm companyId={companyId} token={session.access_token} /><section className="grid employees-grid"><ManualPunchForm companyId={companyId} employees={data?.employees ?? []} locations={data?.locations ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><AdjustmentForm companyId={companyId} punches={data?.punches ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section><Adjustments values={data?.adjustments ?? []} employees={data?.employees ?? []} /></>}
+      {activeTab === 'overview' && <><SetupGuide companyId={companyId} locations={data?.locations ?? []} employees={data?.employees ?? []} terminals={data?.terminals ?? []} schedules={data?.schedules ?? []} /><section className="metrics"><Metric label={`Jornadas (${dashboardRecentDays} dias)`} value={String(data?.days?.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label={`Saldo nos últimos ${dashboardRecentDays} dias`} value={minutes(data?.balance)} /></section><RecentPunches values={data?.punches ?? []} days={data?.days ?? []} /><section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section></>}
+      {activeTab === 'timesheet' && <><TimesheetFilters employees={data?.employees ?? []} locations={data?.locations ?? []} employeeId={employeeId} locationId={locationId} from={from} to={to} onApply={(next) => { const queryChanged = next.employeeId !== employeeId || next.from !== from || next.to !== to; const allFiltersUnchanged = !queryChanged && next.locationId === locationId; setEmployeeId(next.employeeId); setLocationId(next.locationId); setFrom(next.from); setTo(next.to); if (allFiltersUnchanged) setTimesheetRefresh((value) => value + 1); }} />{canLoadTimesheet ? timesheetDataKey === timesheetQueryKey ? <Timesheet employee={data?.employees?.find((item) => item.id === employeeId)} punches={data?.punches ?? []} days={data?.days ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} selectedLocationId={locationId} from={from} to={to} onSaved={() => setTimesheetRefresh((value) => value + 1)} /> : <p className="notice">Carregando apuração…</p> : <p className="notice">Escolha um funcionário e informe as datas de início e fim para abrir a apuração.</p>}</>}
+      {activeTab === 'payments' && <PaymentManagement companyId={companyId} employees={data?.employees ?? []} departments={data?.departments ?? []} token={session.access_token} />}
+      {activeTab === 'people' && <><RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onUseForRegistration={setRegistrationDraft} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeManagement values={data?.employees ?? []} departments={data?.departments ?? []} facialProfiles={data?.facialProfiles ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /><FacialProfileProvisioning employees={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
+      {activeTab === 'terminals' && <><section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Terminals values={data?.terminals ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section></>}
+      {activeTab === 'schedules' && <><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><ScheduleAssignment companyId={companyId} employees={data?.employees ?? []} schedules={data?.schedules ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><DailySchedulePlans values={data?.dailyPlans ?? []} employees={data?.employees ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><ScheduleAssignments values={data?.scheduleAssignments ?? []} employees={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
+      {activeTab === 'settings' && <><DepartmentManagement departments={data?.departments ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><AbsenceCategoryManagement companyId={companyId} token={session.access_token} /><section className="grid employees-grid"><ManualPunchForm companyId={companyId} employees={data?.employees ?? []} locations={data?.locations ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><AdjustmentForm companyId={companyId} punches={data?.punches ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section><Adjustments values={data?.adjustments ?? []} employees={data?.employees ?? []} /></>}
     </>}
   </main>;
 }
@@ -246,65 +331,7 @@ function OccurrenceRow({ occurrence, companyId, token, onSaved }: { occurrence: 
 function Bank({ values }: { values: BankEntry[] }) { return <section className="panel"><h2>Banco de horas</h2><div className="table-wrap"><table><thead><tr><th>Quando</th><th>Motivo</th><th>Saldo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{dateTime(item.created_at)}</td><td>{item.reason}</td><td>{minutes(item.delta_minutes)}</td></tr>)}{!values.length && <Empty colSpan={3} />}</tbody></table></div></section>; }
 function Empty({ colSpan }: { colSpan: number }) { return <tr><td colSpan={colSpan} className="empty">Nenhum registro para este filtro.</td></tr>; }
 function punchKind(value: string) { return ({ entry: 'Entrada', break_start: 'Início do intervalo', break_end: 'Fim do intervalo', exit: 'Saída', unclassified: 'Registrada' } as Record<string, string>)[value] ?? 'Registrada'; }
-function RecentPunches({ values, days }: { values: Punch[]; days: WorkDay[] }) { const calculatedTypes = new Map(days.flatMap((day) => currentCalculation(day)?.classifications ?? []).map((item) => [item.event_id, item.type])); return <section className="panel recent-punches"><h2>Registros de ponto</h2><p>Mostra o funcionário, local e período selecionados acima. A jornada une as batidas da mesma pessoa, mesmo quando ocorrerem em locais diferentes.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Local</th><th>Quando</th><th>Tipo calculado</th><th>Origem</th><th>Status</th></tr></thead><tbody>{values.slice(0, 200).map((item) => <tr key={item.id}><td>{item.employee_name ?? 'Funcionário não localizado'}{item.employee_registration ? ` · ${item.employee_registration}` : ''}</td><td>{item.location_name ?? '—'}</td><td>{dateTime(item.timestamp)}</td><td>{punchKind(calculatedTypes.get(item.id) ?? item.punch_type)}</td><td>{item.source === 'manual' ? 'Inclusa pelo responsável' : 'Reconhecimento facial'}</td><td>{item.sync_status === 'accepted' ? 'Confirmada' : 'Em análise'}</td></tr>)}{!values.length && <Empty colSpan={6} />}</tbody></table></div></section>; }
-function paymentInput(cents: number) { return cents === 0 ? '' : (cents / 100).toFixed(2).replace('.', ','); }
-function parsePaymentInput(value: string) { const parsed = Number(value.replace('.', '').replace(',', '.')); return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed * 100) : 0; }
-function MoneyInput({ value, onValueChange }: { value: number; onValueChange: (value: number) => void }) {
-  const [raw, setRaw] = useState(paymentInput(value));
-  useEffect(() => { setRaw(paymentInput(value)); }, [value]);
-  function commit() { const cents = parsePaymentInput(raw); onValueChange(cents); setRaw(paymentInput(cents)); }
-  return <input inputMode="decimal" value={raw} placeholder="0,00" onChange={(event) => setRaw(event.target.value)} onBlur={commit} />;
-}
-function CompanyPaymentSettingsForm({ companyId, token }: { companyId: string; token: string }) {
-  const blank = { regular_hour_cents: 0, overtime_hour_cents: 0, meal_cents: 0, dinner_cents: 0, daily_allowance_cents: 0, night_shift_cents: 0, saturday_cents: 0 };
-  const [settings, setSettings] = useState<CompanyPaymentSettings | null>(null); const [values, setValues] = useState(blank); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
-  useEffect(() => { let active = true; void api<{ data: CompanyPaymentSettings | null }>(withQuery('/v1/company-payment-settings', { company_id: companyId }), token).then((result) => { if (!active) return; setSettings(result.data); setValues(result.data ? { regular_hour_cents: result.data.regular_hour_cents, overtime_hour_cents: result.data.overtime_hour_cents, meal_cents: result.data.meal_cents, dinner_cents: result.data.dinner_cents, daily_allowance_cents: result.data.daily_allowance_cents, night_shift_cents: result.data.night_shift_cents, saturday_cents: result.data.saturday_cents } : blank); }).catch((cause) => { if (active) setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível carregar os valores gerais.'); }); return () => { active = false; }; }, [companyId, token]);
-  const fields: Array<[keyof typeof blank, string]> = [['regular_hour_cents', 'Hora normal'], ['overtime_hour_cents', 'Hora extra / serão'], ['meal_cents', 'Almoço'], ['dinner_cents', 'Janta'], ['daily_allowance_cents', 'Diária'], ['night_shift_cents', 'Madrugada'], ['saturday_cents', 'Sábado']];
-  async function save(event: FormEvent) { event.preventDefault(); setPending(true); setMessage(''); try { const saved = await api<CompanyPaymentSettings>('/v1/company-payment-settings', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, expected_version: settings?.version ?? null, ...values }) }); setSettings(saved); setMessage('Valores gerais salvos. Eles serão usados como referência para todos os funcionários.'); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível salvar os valores gerais.'); } finally { setPending(false); } }
-  return <section className="payment-settings"><div><strong>Valores gerais da empresa</strong><span>Preencha uma vez os valores padrão. Informe R$ usando vírgula, por exemplo 15,00.</span></div><form onSubmit={save}>{fields.map(([key, label]) => <label key={key}>{label}<MoneyInput value={values[key]} onValueChange={(value) => setValues((current) => ({ ...current, [key]: value }))} /></label>)}<button disabled={pending}>{pending ? 'Salvando…' : 'Salvar valores gerais'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
-}
-function PaymentSettingsForm({ employee, companyId, token, onSaved }: { employee: Employee; companyId: string; token: string; onSaved?: () => void }) {
-  const blank = { regular_hour_cents: 0, overtime_hour_cents: 0, meal_cents: 0, dinner_cents: 0, daily_allowance_cents: 0, night_shift_cents: 0, saturday_cents: 0 };
-  const [settings, setSettings] = useState<EmployeePaymentSettings | null>(null); const [values, setValues] = useState(blank); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
-  useEffect(() => { let active = true; setMessage(''); void api<{ data: EmployeePaymentSettings | null }>(withQuery('/v1/payment-settings', { company_id: companyId, employee_id: employee.id }), token).then((result) => { if (!active) return; setSettings(result.data); setValues(result.data ? { regular_hour_cents: result.data.regular_hour_cents, overtime_hour_cents: result.data.overtime_hour_cents, meal_cents: result.data.meal_cents, dinner_cents: result.data.dinner_cents, daily_allowance_cents: result.data.daily_allowance_cents, night_shift_cents: result.data.night_shift_cents, saturday_cents: result.data.saturday_cents } : blank); }).catch((cause) => { if (active) setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível carregar os valores.'); }); return () => { active = false; }; }, [companyId, employee.id, token]);
-  const fields: Array<[keyof typeof blank, string]> = [['regular_hour_cents', 'Hora normal'], ['overtime_hour_cents', 'Hora extra'], ['meal_cents', 'Almoço'], ['dinner_cents', 'Janta'], ['daily_allowance_cents', 'Diária'], ['night_shift_cents', 'Madrugada'], ['saturday_cents', 'Sábado']];
-  async function save(event: FormEvent) { event.preventDefault(); setPending(true); setMessage(''); try { const saved = await api<EmployeePaymentSettings>('/v1/payment-settings', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employee.id, expected_version: settings?.version ?? null, ...values }) }); setSettings(saved); setValues({ regular_hour_cents: saved.regular_hour_cents, overtime_hour_cents: saved.overtime_hour_cents, meal_cents: saved.meal_cents, dinner_cents: saved.dinner_cents, daily_allowance_cents: saved.daily_allowance_cents, night_shift_cents: saved.night_shift_cents, saturday_cents: saved.saturday_cents }); setMessage('Valores de pagamento salvos para este funcionário.'); onSaved?.(); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível salvar os valores.'); } finally { setPending(false); } }
-  return <section className="payment-settings"><div><strong>Valores exclusivos deste funcionário</strong><span>Preencha somente se {employee.name} receber valores diferentes do padrão da empresa. Use R$ e vírgula, por exemplo 15,00.</span></div><form onSubmit={save}>{fields.map(([key, label]) => <label key={key}>{label}<MoneyInput value={values[key]} onValueChange={(value) => setValues((current) => ({ ...current, [key]: value }))} /></label>)}<button disabled={pending}>{pending ? 'Salvando…' : 'Salvar valores'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
-}
-function DailyAllowances({ employee, companyId, token, dates, from, to, onSaved }: { employee: Employee; companyId: string; token: string; dates: string[]; from: string; to: string; onSaved?: () => void }) {
-  const [items, setItems] = useState<EmployeePaymentDay[]>([]); const [message, setMessage] = useState(''); const [pendingDate, setPendingDate] = useState('');
-  async function load() { try { const result = await api<{ data: EmployeePaymentDay[] }>(withQuery('/v1/payment-days', { company_id: companyId, employee_id: employee.id, date_from: from || undefined, date_to: to || undefined }), token); setItems(result.data); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível carregar os adicionais do período.'); } }
-  useEffect(() => { void load(); }, [companyId, employee.id, from, to, token]);
-  const byDate = new Map(items.map((item) => [item.local_date, item]));
-  const fields: Array<[keyof Pick<EmployeePaymentDay, 'meal_units' | 'dinner_units' | 'daily_allowance_units' | 'night_shift_units' | 'saturday_units'>, string]> = [['meal_units', 'Almoço'], ['dinner_units', 'Janta'], ['daily_allowance_units', 'Diária'], ['night_shift_units', 'Madrugada'], ['saturday_units', 'Sábado']];
-  async function setAllowance(date: string, field: typeof fields[number][0], enabled: boolean) { const current = byDate.get(date); const payload = { meal_units: current?.meal_units ?? 0, dinner_units: current?.dinner_units ?? 0, daily_allowance_units: current?.daily_allowance_units ?? 0, night_shift_units: current?.night_shift_units ?? 0, saturday_units: current?.saturday_units ?? 0, [field]: enabled ? 1 : 0 }; setPendingDate(date); setMessage(''); try { await api('/v1/payment-days', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employee.id, local_date: date, expected_version: current?.version ?? null, ...payload }) }); await load(); onSaved?.(); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível salvar o adicional.'); } finally { setPendingDate(''); } }
-  return <section className="daily-allowances"><div><strong>Adicionais do dia</strong><span>Marque o que foi pago ou concedido em cada data. Os valores vêm da configuração geral ou do valor exclusivo do funcionário.</span></div><div className="table-wrap"><table><thead><tr><th>Data</th>{fields.map(([, label]) => <th key={label}>{label}</th>)}</tr></thead><tbody>{dates.map((date) => { const item = byDate.get(date); return <tr key={date}><td>{dayLabel(date)}</td>{fields.map(([field, label]) => <td key={field}><label className="allowance-check"><input type="checkbox" checked={Boolean(item?.[field])} disabled={Boolean(pendingDate)} aria-label={`${label} em ${date}`} onChange={(event) => void setAllowance(date, field, event.target.checked)} /><span>{item?.[field] ? 'Sim' : 'Não'}</span></label></td>)}</tr>; })}{!dates.length && <Empty colSpan={6} />}</tbody></table></div>{message && <p className="form-message">{message}</p>}</section>;
-}
-function currency(cents: number) { return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(cents / 100); }
-function pairedMinutes(events: Punch[]) { let total = 0; for (let index = 0; index + 1 < events.length; index += 2) total += Math.max(0, Math.round((Date.parse(events[index + 1].timestamp) - Date.parse(events[index].timestamp)) / 60_000)); return total; }
-function Timesheet({ employee, punches, days, locations, companyId, token, selectedLocationId, from, to, onSaved }: { employee: Employee | undefined; punches: Punch[]; days: WorkDay[]; locations: Location[]; companyId: string; token: string; selectedLocationId: string; from: string; to: string; onSaved: () => void }) {
-  const [message, setMessage] = useState(''); const [pending, setPending] = useState(false); const [ratesRefresh, setRatesRefresh] = useState(0);
-  const [allowances, setAllowances] = useState<EmployeePaymentDay[]>([]);
-  const [rates, setRates] = useState({ regular_hour_cents: 0, overtime_hour_cents: 0, meal_cents: 0, dinner_cents: 0, daily_allowance_cents: 0, night_shift_cents: 0, saturday_cents: 0 });
-  const slotOrder = ['entry', 'break_start', 'break_end', 'exit'];
-  useEffect(() => { let active = true; if (!employee) return; void Promise.all([api<{ data: CompanyPaymentSettings | null }>(withQuery('/v1/company-payment-settings', { company_id: companyId }), token), api<{ data: EmployeePaymentSettings | null }>(withQuery('/v1/payment-settings', { company_id: companyId, employee_id: employee.id }), token), api<{ data: EmployeePaymentDay[] }>(withQuery('/v1/payment-days', { company_id: companyId, employee_id: employee.id, date_from: from || undefined, date_to: to || undefined }), token)]).then(([company, individual, paymentDays]) => { if (!active) return; const source = individual.data ?? company.data; setRates({ regular_hour_cents: source?.regular_hour_cents ?? 0, overtime_hour_cents: source?.overtime_hour_cents ?? 0, meal_cents: source?.meal_cents ?? 0, dinner_cents: source?.dinner_cents ?? 0, daily_allowance_cents: source?.daily_allowance_cents ?? 0, night_shift_cents: source?.night_shift_cents ?? 0, saturday_cents: source?.saturday_cents ?? 0 }); setAllowances(paymentDays.data); }).catch(() => { if (active) { setRates({ regular_hour_cents: 0, overtime_hour_cents: 0, meal_cents: 0, dinner_cents: 0, daily_allowance_cents: 0, night_shift_cents: 0, saturday_cents: 0 }); setAllowances([]); } }); return () => { active = false; }; }, [companyId, employee?.id, token, ratesRefresh, from, to]);
-  const dailyRows = useMemo(() => {
-    const dayByKey = new Map(days.map((day) => [day.local_date, day])); const punchByDay = new Map<string, Punch[]>();
-    punches.forEach((punch) => { const key = fortalezaDate(punch.timestamp); punchByDay.set(key, [...(punchByDay.get(key) ?? []), punch]); });
-    const keys = new Set([...dayByKey.keys(), ...punchByDay.keys()]);
-    if (from && to) { const cursor = new Date(`${from}T12:00:00Z`); const end = new Date(`${to}T12:00:00Z`); while (cursor <= end) { keys.add(cursor.toISOString().slice(0, 10)); cursor.setUTCDate(cursor.getUTCDate() + 1); } }
-    const classifications = new Map(days.flatMap((day) => currentCalculation(day)?.classifications ?? []).map((item) => [item.event_id, item.type]));
-    return [...keys].sort().map((date) => { const slots: Record<string, Punch | undefined> = {}; const extras: Punch[] = []; const events = [...(punchByDay.get(date) ?? [])].sort((left, right) => left.timestamp.localeCompare(right.timestamp)); events.forEach((punch, index) => { const type = classifications.get(punch.id); const slot = type && slotOrder.includes(type) ? type : slotOrder[index]; if (slot && !slots[slot]) slots[slot] = punch; else extras.push(punch); }); const calculation = currentCalculation(dayByKey.get(date) ?? { attendance_calculations: [] } as WorkDay); const absenceMinutes = events.length === 0 && (calculation?.planned_minutes ?? 0) > 0 ? calculation!.planned_minutes : 0; const worked = calculation?.worked_minutes ?? pairedMinutes(events); const extra = calculation?.gross_overtime_minutes ?? 0; const shortage = calculation?.net_balance_minutes != null ? Math.max(0, -calculation.net_balance_minutes) : absenceMinutes; return { date, slots, extras, events, calculation, absenceMinutes, worked, extra, shortage }; });
-  }, [days, punches, from, to]);
-  const allowanceByDate = new Map(allowances.map((item) => [item.local_date, item]));
-  const allowanceMoney = (date: string) => { const item = allowanceByDate.get(date); return (item?.meal_units ?? 0) * rates.meal_cents + (item?.dinner_units ?? 0) * rates.dinner_cents + (item?.daily_allowance_units ?? 0) * rates.daily_allowance_cents + (item?.night_shift_units ?? 0) * rates.night_shift_cents + (item?.saturday_units ?? 0) * rates.saturday_cents; };
-  const rowMoney = (row: typeof dailyRows[number]) => Math.round(row.extra * rates.overtime_hour_cents / 60) - Math.round(row.shortage * rates.regular_hour_cents / 60) + allowanceMoney(row.date);
-  const totals = dailyRows.reduce((result, row) => { const money = rowMoney(row); return { worked: result.worked + row.worked, overtime: result.overtime + row.extra, absences: result.absences + row.shortage, balance: result.balance + row.extra - row.shortage, money: result.money + money }; }, { worked: 0, overtime: 0, absences: 0, balance: 0, money: 0 });
-  async function editPunch(punch: Punch, date: string, label: string) { if (punch.sync_status !== 'accepted') { setMessage('Aguarde a confirmação da batida antes de corrigi-la.'); return; } const time = window.prompt(`Novo horário para ${label} (${date})`, fortalezaTime(punch.timestamp)); if (!time || !/^\d{2}:\d{2}$/.test(time)) return; const reason = window.prompt('Motivo da correção', 'Correção pela apuração do período'); if (!reason?.trim()) return; setPending(true); setMessage(''); try { await api(`/v1/punches/${punch.id}/adjustments`, token, { method: 'POST', body: JSON.stringify({ company_id: companyId, corrected_timestamp: `${date}T${time}:00-03:00`, reason: reason.trim() }) }); setMessage('Horário corrigido. A apuração foi recalculada.'); onSaved(); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível corrigir o horário.'); } finally { setPending(false); } }
-  async function addPunch(date: string, label: string) { const time = window.prompt(`Horário de ${label} (${date})`, '08:00'); if (!time || !/^\d{2}:\d{2}$/.test(time)) return; const reason = window.prompt('Motivo da inclusão', 'Batida esquecida informada na apuração do período'); if (!reason?.trim()) return; const locationId = selectedLocationId || employee?.home_location_id || locations.find((item) => item.active)?.id; if (!locationId) { setMessage('Cadastre ou selecione um local antes de incluir uma batida.'); return; } setPending(true); setMessage(''); try { await api('/v1/manual-punches', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employee?.id, location_id: locationId, corrected_timestamp: `${date}T${time}:00-03:00`, reason: reason.trim() }) }); setMessage('Batida incluída. A apuração foi recalculada.'); onSaved(); } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível incluir a batida.'); } finally { setPending(false); } }
-  const cell = (row: typeof dailyRows[number], slot: string, label: string) => { const punch = row.slots[slot]; const action = () => { if (!pending) void (punch ? editPunch(punch, row.date, label) : addPunch(row.date, label)); }; return <td className="timesheet-cell" title="Use Editar ou Adicionar para alterar este horário" onDoubleClick={action}><div><span>{punch ? fortalezaTime(punch.timestamp) : '—'}</span><button type="button" className="secondary small-button timesheet-edit" disabled={pending} onClick={action}>{punch ? 'Editar' : 'Adicionar'}</button></div></td>; };
-  return <section className="panel timesheet"><div className="timesheet-heading"><div><p className="eyebrow">APURAÇÃO E RELATÓRIO DO PERÍODO</p><h2>{employee?.name ?? 'Funcionário'}</h2><p>{employee?.registration ? `Matrícula: ${employee.registration}` : 'Matrícula não informada'} · {from || 'Início não selecionado'} até {to || 'Fim não selecionado'}</p></div><small>Edite ou adicione horários e a apuração será atualizada. Extra e falta dependem da escala atribuída.</small></div><div className="timesheet-summary"><article><span>Horas trabalhadas</span><strong>{minutes(totals.worked)}</strong></article><article className="positive"><span>Horas extras</span><strong>{minutes(totals.overtime)}</strong></article><article className="negative"><span>Horas faltantes</span><strong>{minutes(totals.absences)}</strong></article><article className={totals.money < 0 ? 'negative' : 'positive'}><span>Saldo financeiro</span><strong>{currency(totals.money)}</strong></article></div><PaymentSettingsForm employee={employee} companyId={companyId} token={token} onSaved={() => setRatesRefresh((value) => value + 1)} /><DailyAllowances employee={employee} companyId={companyId} token={token} from={from} to={to} dates={dailyRows.map((row) => row.date)} onSaved={() => setRatesRefresh((value) => value + 1)} /><ReportDownloads companyId={companyId} employeeId={employee?.id ?? ''} from={from} to={to} token={token} /><div className="table-wrap"><table><thead><tr><th>Data</th><th>Entrada</th><th>Saída 1</th><th>Entrada 2</th><th>Saída 2</th><th>Outras</th><th>Trabalhado</th><th>Extra / falta</th><th>Saldo R$</th></tr></thead><tbody>{dailyRows.map((row) => { const financial = rowMoney(row); const status = row.extra > 0 ? <span className="time-positive">+{minutes(row.extra)}</span> : row.shortage > 0 ? <span className="time-negative">−{minutes(row.shortage).replace(/^[+−]/, '')}</span> : row.calculation ? '0h00' : 'Defina escala'; return <tr key={row.date}><td>{dayLabel(row.date)}</td>{cell(row, 'entry', 'entrada')}{cell(row, 'break_start', 'saída para intervalo')}{cell(row, 'break_end', 'retorno do intervalo')}{cell(row, 'exit', 'saída')}<td>{row.extras.map((punch) => fortalezaTime(punch.timestamp)).join(' · ') || '—'}</td><td>{row.absenceMinutes > 0 ? 'Falta' : minutes(row.worked)}</td><td>{status}</td><td className={financial < 0 ? 'time-negative' : financial > 0 ? 'time-positive' : ''}>{row.calculation || allowanceMoney(row.date) ? currency(financial) : '—'}</td></tr>; })}{!dailyRows.length && <Empty colSpan={9} />}</tbody></table></div><div className="timesheet-totals"><strong>Horas trabalhadas: {minutes(totals.worked)}</strong><strong className="time-positive">Horas extras: {minutes(totals.overtime)}</strong><strong className="time-negative">Faltas: {minutes(totals.absences)}</strong><strong className={totals.money < 0 ? 'time-negative' : 'time-positive'}>Saldo financeiro: {currency(totals.money)}</strong></div>{message && <p className="form-message">{message}</p>}</section>;
-}
+function RecentPunches({ values, days }: { values: Punch[]; days: WorkDay[] }) { const calculatedTypes = new Map(days.flatMap((day) => currentCalculation(day)?.classifications ?? []).map((item) => [item.event_id, item.type])); return <section className="panel recent-punches"><h2>Registros de ponto</h2><p>Mostra os registros dos últimos {dashboardRecentDays} dias. A jornada une as batidas da mesma pessoa, mesmo quando ocorrerem em locais diferentes.</p><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Local</th><th>Quando</th><th>Tipo calculado</th><th>Origem</th><th>Status</th></tr></thead><tbody>{values.slice(0, 200).map((item) => <tr key={item.id}><td>{item.employee_name ?? 'Funcionário não localizado'}{item.employee_registration ? ` · ${item.employee_registration}` : ''}</td><td>{item.location_name ?? '—'}</td><td>{dateTime(item.timestamp)}</td><td>{punchKind(calculatedTypes.get(item.id) ?? item.punch_type)}</td><td>{item.source === 'manual' ? 'Inclusa pelo responsável' : 'Reconhecimento facial'}</td><td>{item.sync_status === 'accepted' ? 'Confirmada' : 'Em análise'}</td></tr>)}{!values.length && <Empty colSpan={6} />}</tbody></table></div></section>; }
 function Adjustments({ values, employees }: { values: PunchAdjustment[]; employees: Employee[] }) { const name = (id: string) => employees.find((employee) => employee.id === id)?.name ?? 'Funcionário não localizado'; return <section className="panel adjustments"><h2>Correções recentes</h2><div className="table-wrap"><table><thead><tr><th>Funcionário</th><th>Registrada</th><th>Novo horário</th><th>Motivo</th></tr></thead><tbody>{values.slice(0, 8).map((item) => <tr key={item.id}><td>{name(item.employee_id)}</td><td>{dateTime(item.created_at)}</td><td>{dateTime(item.corrected_timestamp)}</td><td>{item.reason}</td></tr>)}{!values.length && <Empty colSpan={4} />}</tbody></table></div></section>; }
 function Employees({ values, facialProfiles, companyId, token, onSaved }: { values: Employee[]; facialProfiles: FacialProfileStatus[]; companyId: string; token: string; onSaved: () => void }) { const prepared = new Map(facialProfiles.map((profile) => [profile.employee_id, profile])); return <section className="panel employees"><h2>Funcionários</h2><p>Funcionários desativados permanecem visíveis para que possam ser reativados sem perder o histórico.</p><div className="table-wrap"><table><thead><tr><th>Matrícula</th><th>Nome</th><th>Cargo</th><th>Situação</th><th>Reconhecimento facial</th><th></th></tr></thead><tbody>{values.map((item) => <EmployeeRow key={item.id} employee={item} facialProfile={prepared.get(item.id)} companyId={companyId} token={token} onSaved={onSaved} />)}{!values.length && <Empty colSpan={6} />}</tbody></table></div></section>; }
 function EmployeeRow({ employee, facialProfile, companyId, token, onSaved }: { employee: Employee; facialProfile: FacialProfileStatus | undefined; companyId: string; token: string; onSaved: () => void }) {

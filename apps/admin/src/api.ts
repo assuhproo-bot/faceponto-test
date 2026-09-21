@@ -7,7 +7,8 @@ export type CompanyMembership = {
 export type Me = { user: { id: string; email: string | null }; memberships: CompanyMembership[] };
 export type Punch = {
   id: string; employee_id: string; timestamp: string; punch_type: string; sync_status: string; clock_status: string;
-  source: string; reason?: string; location_name: string | null; employee_name: string | null; employee_registration: string | null;
+  source: string; reason?: string; original_time_punch_id?: string; original_timestamp?: string;
+  location_name: string | null; employee_name: string | null; employee_registration: string | null;
 };
 export type FacialProfileStatus = { employee_id: string; profile_version: number; prepared_at: string };
 export type CompanyPaymentSettings = {
@@ -31,11 +32,40 @@ export type EmployeePaymentDay = {
   id: string; company_id: string; employee_id: string; local_date: string; meal_units: number; dinner_units: number;
   daily_allowance_units: number; night_shift_units: number; saturday_units: number; serao_units: number; version: number;
 };
+export type AbsenceCategory = {
+  id: string; company_id: string; name: string; abones_hours: boolean; active: boolean; version: number;
+  created_at: string; updated_at: string;
+};
+export type DayJustification = {
+  id: string; company_id: string; employee_id: string; local_date: string; absence_category_id: string;
+  abones_hours: boolean; note: string | null; version: number; created_at: string; updated_at: string;
+  absence_categories: Pick<AbsenceCategory, 'id' | 'name' | 'abones_hours' | 'active'> | null;
+};
 export type PaymentRateKey =
   | 'regular_hour_cents' | 'overtime_hour_cents' | 'serao_cents' | 'meal_cents'
   | 'dinner_cents' | 'daily_allowance_cents' | 'night_shift_cents' | 'saturday_cents';
 export type ResolvedPaymentRate = { cents: number; source: 'employee' | 'department' | 'company' | 'none' };
 export type ResolvedPaymentRates = Record<PaymentRateKey, ResolvedPaymentRate>;
+export type DailyFinancialLine = {
+  key: string; kind: string; label: string; cents: number; minutes?: number; units?: number; rateCents: number;
+};
+export type DailyFinancial = {
+  regularCents: number; justifiedCents: number; overtimeCents: number; shortageCents: number; allowanceCents: number;
+  allowanceCentsByKey: Record<'meal' | 'dinner' | 'daily_allowance' | 'night_shift' | 'saturday' | 'serao', number>;
+  totalCents: number; lines: DailyFinancialLine[];
+};
+export type FinancialAttendanceRow = {
+  employeeId: string; date: string; employee: string; registration: string; state: string;
+  plannedMinutes: number; workedMinutes: number | null; regularMinutes: number | null; justifiedMinutes: number | null;
+  missingMinutes: number | null; overtimeMinutes: number | null; balanceMinutes: number | null;
+  financialPending: boolean; financial: DailyFinancial; rates: ResolvedPaymentRates;
+};
+export type FinancialAttendanceTotals = {
+  plannedMinutes: number; workedMinutes: number; regularMinutes: number; justifiedMinutes: number; missingMinutes: number;
+  overtimeMinutes: number; balanceMinutes: number; regularCents: number; justifiedCents: number; overtimeCents: number;
+  shortageCents: number; allowanceCents: number; mealCents: number; dinnerCents: number; dailyAllowanceCents: number;
+  nightShiftCents: number; saturdayCents: number; seraoCents: number; totalCents: number;
+};
 export type WorkDay = {
   id: string; employee_id: string; local_date: string; timezone: string;
   attendance_calculations: Array<{
@@ -86,12 +116,15 @@ export type EmployeeRegistrationRequest = {
 
 const baseUrl = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
 
+/** Uses the deployed API in production and Vite's local proxy during development. */
+export function apiUrl(path: string) { return `${baseUrl}${path}`; }
+
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
 }
 
 export async function api<T>(path: string, accessToken: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${baseUrl}${path}`, {
+  const response = await fetch(apiUrl(path), {
     ...init,
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json', ...(init?.headers ?? {}) },
   });
