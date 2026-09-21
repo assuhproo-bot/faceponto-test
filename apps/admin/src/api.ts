@@ -28,6 +28,14 @@ export type DepartmentPaymentSettings = {
   serao_cents: number | null; meal_cents: number | null; dinner_cents: number | null; daily_allowance_cents: number | null;
   night_shift_cents: number | null; saturday_cents: number | null; version: number;
 };
+export type DepartmentScheduleDefault = {
+  id: string; company_id: string; department_id: string; schedule_version_id: string; valid_from: string; version: number;
+  created_at: string; updated_at: string;
+  schedule_versions: {
+    id: string; version: number; timezone: string;
+    work_schedules: { id: string; name: string; active: boolean } | null;
+  } | null;
+};
 export type EmployeePaymentDay = {
   id: string; company_id: string; employee_id: string; local_date: string; meal_units: number; dinner_units: number;
   daily_allowance_units: number; night_shift_units: number; saturday_units: number; serao_units: number; version: number;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { createClient, type Session } from '@supabase/supabase-js';
 import lugaLogo from './luga-logo.jpg';
-import { api, ApiError, type BankEntry, type Department, type Employee, type EmployeeLocation, type EmployeeRegistrationRequest, type EmployeeSchedulePlan, type FacialProfileStatus, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
+import { api, ApiError, type BankEntry, type Department, type DepartmentScheduleDefault, type Employee, type EmployeeLocation, type EmployeeRegistrationRequest, type EmployeeSchedulePlan, type FacialProfileStatus, type Location, type Me, type Occurrence, type Punch, type PunchAdjustment, type Schedule, type ScheduleAssignment as ScheduleAssignmentRecord, type Terminal, type WorkDay, withQuery } from './api.js';
 import { Timesheet, TimesheetFilters } from './timesheet.js';
 import { AbsenceCategoryManagement, DepartmentManagement, EmployeeManagement, PaymentManagement } from './management.js';
 
@@ -16,7 +16,7 @@ type DashboardData = Partial<{
   days: WorkDay[]; occurrences: Occurrence[]; bank: BankEntry[]; balance: number; punches: Punch[]; adjustments: PunchAdjustment[];
   employees: Employee[]; locations: Location[]; employeeLocations: EmployeeLocation[]; registrationRequests: EmployeeRegistrationRequest[];
   facialProfiles: FacialProfileStatus[]; schedules: Schedule[]; scheduleAssignments: ScheduleAssignmentRecord[]; dailyPlans: EmployeeSchedulePlan[]; terminals: Terminal[];
-  departments: Department[];
+  departments: Department[]; departmentScheduleDefaults: DepartmentScheduleDefault[];
 }>;
 type DashboardState = { companyId: string; data: DashboardData };
 
@@ -217,13 +217,15 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
         return;
       }
       if (activeTab === 'schedules') {
-        const [employees, schedules, scheduleAssignments, dailyPlans] = await Promise.all([
+        const [employees, schedules, scheduleAssignments, dailyPlans, departments, departmentScheduleDefaults] = await Promise.all([
           api<{ data: Employee[] }>(withQuery('/v1/employees', { company_id: companyId }), session.access_token),
           api<{ data: Schedule[] }>(withQuery('/v1/schedules', { company_id: companyId }), session.access_token),
           api<{ data: ScheduleAssignmentRecord[] }>(withQuery('/v1/schedule-assignments', { company_id: companyId }), session.access_token),
           api<{ data: EmployeeSchedulePlan[] }>(withQuery('/v1/employee-schedule-plans', { company_id: companyId }), session.access_token),
+          api<{ data: Department[] }>(withQuery('/v1/departments', { company_id: companyId }), session.access_token),
+          api<{ data: DepartmentScheduleDefault[] }>(withQuery('/v1/department-schedule-defaults', { company_id: companyId }), session.access_token),
         ]);
-        if (active) mergeDashboardData(companyId, { employees: employees.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data });
+        if (active) mergeDashboardData(companyId, { employees: employees.data, schedules: schedules.data, scheduleAssignments: scheduleAssignments.data, dailyPlans: dailyPlans.data, departments: departments.data, departmentScheduleDefaults: departmentScheduleDefaults.data });
         return;
       }
       const period = recentDateRange();
@@ -281,7 +283,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       {activeTab === 'payments' && <PaymentManagement companyId={companyId} employees={data?.employees ?? []} departments={data?.departments ?? []} token={session.access_token} />}
       {activeTab === 'people' && <><RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onUseForRegistration={setRegistrationDraft} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeManagement values={data?.employees ?? []} departments={data?.departments ?? []} facialProfiles={data?.facialProfiles ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /><FacialProfileProvisioning employees={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
       {activeTab === 'terminals' && <><section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Terminals values={data?.terminals ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section></>}
-      {activeTab === 'schedules' && <><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><ScheduleAssignment companyId={companyId} employees={data?.employees ?? []} schedules={data?.schedules ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><DailySchedulePlans values={data?.dailyPlans ?? []} employees={data?.employees ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><ScheduleAssignments values={data?.scheduleAssignments ?? []} employees={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
+      {activeTab === 'schedules' && <><Schedules values={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><DepartmentScheduleDefaults values={data?.departmentScheduleDefaults ?? []} departments={data?.departments ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><ScheduleAssignment companyId={companyId} employees={data?.employees ?? []} schedules={data?.schedules ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><DailySchedulePlans values={data?.dailyPlans ?? []} employees={data?.employees ?? []} schedules={data?.schedules ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><ScheduleAssignments values={data?.scheduleAssignments ?? []} employees={data?.employees ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
       {activeTab === 'settings' && <><DepartmentManagement departments={data?.departments ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><AbsenceCategoryManagement companyId={companyId} token={session.access_token} /><section className="grid employees-grid"><ManualPunchForm companyId={companyId} employees={data?.employees ?? []} locations={data?.locations ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><AdjustmentForm companyId={companyId} punches={data?.punches ?? []} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section><Adjustments values={data?.adjustments ?? []} employees={data?.employees ?? []} /></>}
     </>}
   </main>;
@@ -488,6 +490,33 @@ function Schedules({ values, companyId, token, onSaved }: { values: Schedule[]; 
   }
   const dayLabels = [{ day: 1, label: 'Seg' }, { day: 2, label: 'Ter' }, { day: 3, label: 'Qua' }, { day: 4, label: 'Qui' }, { day: 5, label: 'Sex' }, { day: 6, label: 'Sáb' }, { day: 7, label: 'Dom' }];
   return <section className="panel schedules"><h2>Escalas</h2><ul className="simple-list">{values.map((item) => <li key={item.id}><strong>{item.name}</strong>{item.schedule_versions[0] && <small>{item.schedule_versions[0].schedule_segments.map((segment) => `${formatMinute(segment.start_minute)}–${formatMinute(segment.end_minute)}`).join(' · ')}</small>}</li>)}{!values.length && <li>Nenhuma escala cadastrada.</li>}</ul><form onSubmit={submit} className="schedule-editor"><label>Nome da escala<input required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} placeholder="Ex.: Administrativo com intervalo" /></label><fieldset className="weekday-picker"><legend>Dias de trabalho</legend>{dayLabels.map(({ day, label }) => <label key={day}><input type="checkbox" checked={weekdays.includes(day)} onChange={() => toggleWeekday(day)} />{label}</label>)}</fieldset><div className="segment-editor"><strong>Períodos trabalhados</strong>{segments.map((segment, index) => <div className="segment-row" key={segment.id}><span>{index + 1}.</span><label>Entrada<input type="time" required value={segment.start} onChange={(event) => updateSegment(segment.id, 'start', event.target.value)} /></label><label>Saída<input type="time" required value={segment.end} onChange={(event) => updateSegment(segment.id, 'end', event.target.value)} /></label><label className="next-day"><input type="checkbox" checked={segment.nextDay} onChange={(event) => updateSegment(segment.id, 'nextDay', event.target.checked)} />Termina no dia seguinte</label><button type="button" className="secondary small-button" disabled={segments.length === 1} onClick={() => removeSegment(segment.id)}>Remover</button></div>)}<button type="button" className="secondary add-segment" disabled={segments.length >= 12} onClick={addSegment}>Adicionar período</button></div><button>Criar escala</button></form>{message && <p className="form-message">{message}</p>}</section>;
+}
+function DepartmentScheduleDefaults({ values, departments, schedules, companyId, token, onSaved }: { values: DepartmentScheduleDefault[]; departments: Department[]; schedules: Schedule[]; companyId: string; token: string; onSaved: () => void }) {
+  const activeDepartments = departments.filter((item) => item.active); const versions = schedules.flatMap((schedule) => schedule.schedule_versions.map((version) => ({ id: version.id, label: `${schedule.name} · versão ${version.version}` })));
+  const [departmentId, setDepartmentId] = useState(''); const [versionId, setVersionId] = useState(''); const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); const [applyToUnassigned, setApplyToUnassigned] = useState(true); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
+  useEffect(() => { if (!activeDepartments.some((item) => item.id === departmentId)) setDepartmentId(activeDepartments[0]?.id ?? ''); }, [activeDepartments, departmentId]);
+  const current = values.find((item) => item.department_id === departmentId);
+  useEffect(() => {
+    if (current) { setVersionId(current.schedule_version_id); setDate(current.valid_from); return; }
+    if (!versions.some((item) => item.id === versionId)) setVersionId(versions[0]?.id ?? '');
+  }, [current, versionId, versions]);
+  async function save(event: FormEvent) {
+    event.preventDefault(); if (!departmentId || !versionId) return; setPending(true); setMessage('');
+    try {
+      const result = await api<{ assigned_count: number }>('/v1/department-schedule-defaults', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, department_id: departmentId, schedule_version_id: versionId, valid_from: date, expected_version: current?.version ?? null, apply_to_unassigned: applyToUnassigned }) });
+      setMessage(result.assigned_count ? `Padrão salvo e aplicado a ${result.assigned_count} funcionário(s) sem escala própria.` : 'Escala padrão do cargo salva.'); onSaved();
+    } catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível salvar a escala padrão do cargo.'); }
+    finally { setPending(false); }
+  }
+  async function clear(item: DepartmentScheduleDefault) {
+    setPending(true); setMessage('');
+    try { await api(`/v1/department-schedule-defaults/${item.department_id}`, token, { method: 'DELETE', body: JSON.stringify({ company_id: companyId, expected_version: item.version }) }); setMessage('Escala padrão removida. Os vínculos individuais foram preservados.'); onSaved(); }
+    catch (cause) { setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível remover a escala padrão.'); }
+    finally { setPending(false); }
+  }
+  const departmentName = (id: string) => departments.find((item) => item.id === id)?.name ?? 'Cargo removido';
+  const scheduleName = (item: DepartmentScheduleDefault) => item.schedule_versions?.work_schedules?.name ?? 'Escala removida';
+  return <section className="panel department-schedule-defaults"><h2>Escala padrão por cargo</h2><p>Novos funcionários recebem a escala do cargo automaticamente. Ao aplicar abaixo, somente quem ainda não tem escala individual é incluído; exceções existentes são preservadas.</p><div className="table-wrap"><table><thead><tr><th>Cargo</th><th>Escala</th><th>Válida desde</th><th></th></tr></thead><tbody>{values.map((item) => <tr key={item.id}><td>{departmentName(item.department_id)}</td><td>{scheduleName(item)} · versão {item.schedule_versions?.version ?? '—'}</td><td>{item.valid_from}</td><td><button type="button" className="secondary small-button" disabled={pending} onClick={() => void clear(item)}>Retirar padrão</button></td></tr>)}{!values.length && <tr><td colSpan={4} className="empty">Nenhum cargo possui escala padrão.</td></tr>}</tbody></table></div><form onSubmit={save} className="department-schedule-form"><label>Cargo<select required value={departmentId} onChange={(event) => setDepartmentId(event.target.value)}><option value="">Selecione</option>{activeDepartments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Escala padrão<select required value={versionId} onChange={(event) => setVersionId(event.target.value)}><option value="">Selecione</option>{versions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><label>Válida desde<input required type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label className="checkbox-label"><input type="checkbox" checked={applyToUnassigned} onChange={(event) => setApplyToUnassigned(event.target.checked)} />Aplicar a quem não tem escala própria</label><button disabled={pending || !departmentId || !versionId}>{pending ? 'Salvando…' : current ? 'Atualizar padrão' : 'Definir padrão'}</button></form>{message && <p className="form-message">{message}</p>}</section>;
 }
 function ScheduleAssignment({ companyId, employees, schedules, token, onSaved }: { companyId: string; employees: Employee[]; schedules: Schedule[]; token: string; onSaved: () => void }) {
   const [employeeId, setEmployeeId] = useState(''); const [versionId, setVersionId] = useState(''); const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); const [message, setMessage] = useState('');

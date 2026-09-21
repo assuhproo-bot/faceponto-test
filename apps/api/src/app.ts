@@ -52,6 +52,15 @@ const departmentParams = z.object({ id: z.uuid() }).strict();
 const departmentUpdateBody = z.object({
   company_id: z.uuid(), expected_version: z.number().int().positive(), name: z.string().trim().min(1).max(120).optional(), active: z.boolean().optional(),
 }).strict().refine((value) => value.name !== undefined || value.active !== undefined);
+const departmentScheduleDefaultsQuery = z.object({ company_id: z.uuid() }).strict();
+const departmentScheduleDefaultBody = z.object({
+  company_id: z.uuid(), department_id: z.uuid(), schedule_version_id: z.uuid(), valid_from: z.iso.date(),
+  expected_version: z.number().int().positive().nullable().optional(), apply_to_unassigned: z.boolean().default(true),
+}).strict();
+const departmentScheduleDefaultParams = z.object({ departmentId: z.uuid() }).strict();
+const clearDepartmentScheduleDefaultBody = z.object({
+  company_id: z.uuid(), expected_version: z.number().int().positive(),
+}).strict();
 const terminalBody = z.object({
   company_id: z.uuid(), location_id: z.uuid(), code: z.string().trim().min(1).max(40), name: z.string().trim().min(1).max(160),
 }).strict();
@@ -573,6 +582,31 @@ export function buildApp(config: ApiConfig) {
       p_expected_version: body.expected_version,
       p_name: body.name ?? null,
       p_active: body.active ?? null,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return data;
+  });
+  app.get('/v1/department-schedule-defaults', async (request, reply) => {
+    const query = departmentScheduleDefaultsQuery.parse(request.query);
+    const { data, error: dbError } = await request.auth!.db.from('department_schedule_defaults')
+      .select('id,company_id,department_id,schedule_version_id,valid_from,version,created_at,updated_at,schedule_versions(id,version,timezone,work_schedules(id,name,active))')
+      .eq('company_id', query.company_id).order('valid_from').limit(200);
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return { data };
+  });
+  app.post('/v1/department-schedule-defaults', async (request, reply) => {
+    const body = departmentScheduleDefaultBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('save_department_schedule_default', {
+      p_company: body.company_id, p_department: body.department_id, p_schedule_version: body.schedule_version_id,
+      p_valid_from: body.valid_from, p_expected_version: body.expected_version ?? null, p_apply_to_unassigned: body.apply_to_unassigned,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
+  });
+  app.delete('/v1/department-schedule-defaults/:departmentId', async (request, reply) => {
+    const params = departmentScheduleDefaultParams.parse(request.params); const body = clearDepartmentScheduleDefaultBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('clear_department_schedule_default', {
+      p_company: body.company_id, p_department: params.departmentId, p_expected_version: body.expected_version,
     });
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return data;

@@ -129,7 +129,7 @@ after(async () => {
       'public.work_schedules', 'public.terminal_location_assignments', 'public.employee_locations',
       'private.employee_documents', 'public.day_justifications', 'public.employee_payment_days',
       'public.employee_payment_settings', 'public.department_payment_settings', 'public.company_payment_settings',
-      'private.employee_registration_counters', 'public.employees', 'public.departments',
+      'public.department_schedule_defaults', 'private.employee_registration_counters', 'public.employees', 'public.departments',
       'public.absence_categories', 'public.member_locations',
       'public.terminals', 'public.locations', 'public.company_memberships',
     ]) await sql.query(`delete from ${table} where company_id = any($1)`, [companies]);
@@ -484,6 +484,51 @@ test('schedule assignments preserve history, reject overlaps and obey tenant iso
     company_id: companyA, valid_to: '2026-12-01T00:00:00-03:00',
   });
   assert.equal(secondClose.statusCode, 422, secondClose.body);
+});
+
+test('a cargo default assigns its scale to existing unscheduled employees and future hires', async () => {
+  const cargos = await request('GET', `/v1/departments?company_id=${companyA}`, tokenA);
+  const chapa = cargos.json().data.find((item: { name: string }) => item.name === 'Chapa');
+  assert.ok(chapa);
+  const existing = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, name: 'Chapa sem escala individual', department_id: chapa.id, home_location_id: locationA,
+  });
+  assert.equal(existing.statusCode, 201, existing.body);
+
+  const saved = await request('POST', '/v1/department-schedule-defaults', tokenA, {
+    company_id: companyA, department_id: chapa.id, schedule_version_id: scheduleVersionId,
+    valid_from: '2026-12-10', apply_to_unassigned: true,
+  });
+  assert.equal(saved.statusCode, 201, saved.body);
+  assert.equal(saved.json().assigned_count, 1);
+  const defaults = await request('GET', `/v1/department-schedule-defaults?company_id=${companyA}`, tokenA);
+  assert.equal(defaults.statusCode, 200, defaults.body);
+  assert.equal(defaults.json().data[0].department_id, chapa.id);
+
+  const existingAssignments = await request('GET', `/v1/schedule-assignments?company_id=${companyA}&employee_id=${existing.json().id}`, tokenA);
+  assert.equal(existingAssignments.statusCode, 200, existingAssignments.body);
+  assert.equal(existingAssignments.json().data[0].schedule_version_id, scheduleVersionId);
+  assert.equal(existingAssignments.json().data[0].valid_from, '2026-12-10');
+
+  const hire = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, name: 'Novo chapa com padrão', department_id: chapa.id, home_location_id: locationA,
+  });
+  assert.equal(hire.statusCode, 201, hire.body);
+  const hireAssignments = await request('GET', `/v1/schedule-assignments?company_id=${companyA}&employee_id=${hire.json().id}`, tokenA);
+  assert.equal(hireAssignments.statusCode, 200, hireAssignments.body);
+  assert.equal(hireAssignments.json().data[0].schedule_version_id, scheduleVersionId);
+  assert.equal(hireAssignments.json().data[0].valid_from, '2026-12-10');
+
+  const removed = await request('DELETE', `/v1/department-schedule-defaults/${chapa.id}`, tokenA, {
+    company_id: companyA, expected_version: saved.json().version,
+  });
+  assert.equal(removed.statusCode, 200, removed.body);
+  const retained = await request('GET', `/v1/schedule-assignments?company_id=${companyA}&employee_id=${hire.json().id}`, tokenA);
+  assert.equal(retained.json().data.length, 1, 'removing the cargo default must preserve individual history');
+
+  const foreign = await request('GET', `/v1/department-schedule-defaults?company_id=${companyA}`, tokenB);
+  assert.equal(foreign.statusCode, 200, foreign.body);
+  assert.deepEqual(foreign.json().data, []);
 });
 
 test('daily schedule plans override only the selected date and remain tenant-scoped', async () => {

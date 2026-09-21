@@ -25,6 +25,12 @@ function currency(cents: number) { return new Intl.NumberFormat('pt-BR', { style
 function dayLabel(value: string) { return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Fortaleza', weekday: 'short', day: '2-digit', month: '2-digit' }).format(new Date(`${value}T12:00:00-03:00`)); }
 function fortalezaDate(value: string) { const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Fortaleza', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(value)); const part = (type: string) => parts.find((item) => item.type === type)?.value ?? ''; return `${part('year')}-${part('month')}-${part('day')}`; }
 function fortalezaTime(value: string) { return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Fortaleza', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value)); }
+function datesInRange(from: string, to: string) {
+  if (!from || !to || to < from) return [] as string[];
+  const cursor = new Date(`${from}T12:00:00-03:00`); const end = new Date(`${to}T12:00:00-03:00`); const result: string[] = [];
+  while (cursor <= end) { result.push(cursor.toISOString().slice(0, 10)); cursor.setUTCDate(cursor.getUTCDate() + 1); }
+  return result;
+}
 function currentCalculation(day: WorkDay | undefined) {
   const calculations = day?.attendance_calculations ?? [];
   const eligible = calculations.filter((item) => item.state !== 'superseded');
@@ -190,7 +196,10 @@ export function Timesheet({ employee, punches, days, locations, companyId, token
     const punchesByDate = new Map<string, Punch[]>();
     for (const punch of punches.filter((item) => item.employee_id === employee.id)) { const date = fortalezaDate(punch.timestamp); punchesByDate.set(date, [...(punchesByDate.get(date) ?? []), punch]); }
     const classifications = new Map(days.filter((day) => day.employee_id === employee.id).flatMap((day) => currentCalculation(day)?.classifications ?? []).map((item) => [item.event_id, item.type]));
-    const dates = new Set([...financialByDate.keys(), ...punchesByDate.keys()]);
+    // Every searched day remains visible even before it has a calculation or
+    // a punch. This keeps the explicit "Adicionar" actions available after
+    // a new search, including a day that was completely missed.
+    const dates = new Set([...datesInRange(from, to), ...financialByDate.keys(), ...punchesByDate.keys()]);
     return [...dates].sort().map((date) => {
       const dayPunches = [...(punchesByDate.get(date) ?? [])].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
       const mapped: Partial<Record<Slot, Punch>> = {}; const extras: Punch[] = [];
@@ -201,7 +210,7 @@ export function Timesheet({ employee, punches, days, locations, companyId, token
       }
       return { date, financial: financialByDate.get(date), slots: mapped, extras };
     });
-  }, [dataReady, days, employee, punches, rows]);
+  }, [dataReady, days, employee, from, punches, rows, to]);
   const justificationByDate = new Map((dataReady ? justifications : []).map((item) => [item.local_date, item]));
   const activeLocationId = selectedLocationId || employee?.home_location_id || locations.find((item) => item.active)?.id;
   async function editPunch(punch: Punch, date: string, time: string, reason: string) {
