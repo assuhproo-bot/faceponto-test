@@ -1072,6 +1072,64 @@ test('worker usa datas locais no primeiro dia e na troca de escala', async () =>
   ]);
 });
 
+test('worker revisa uma jornada já calculada quando a escala muda no mesmo dia', async () => {
+  const employee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `R-${stamp}`, name: 'Pessoa com escala corrigida', home_location_id: locationA,
+  });
+  assert.equal(employee.statusCode, 201, employee.body);
+  const firstSchedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Primeira escala ${stamp}`, timezone: 'America/Fortaleza', weekdays: [1],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 0 },
+    segments: [{ ordinal: 1, start_minute: 480, end_minute: 720 }],
+  });
+  const correctedSchedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Escala corrigida ${stamp}`, timezone: 'America/Fortaleza', weekdays: [1],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 0 },
+    segments: [{ ordinal: 1, start_minute: 480, end_minute: 780 }],
+  });
+  assert.equal(firstSchedule.statusCode, 201, firstSchedule.body);
+  assert.equal(correctedSchedule.statusCode, 201, correctedSchedule.body);
+  const versions = await sql.query(
+    'select id,schedule_id from public.schedule_versions where company_id=$1 and schedule_id = any($2)',
+    [companyA, [firstSchedule.json().id, correctedSchedule.json().id]],
+  );
+  const firstVersion = versions.rows.find((item) => item.schedule_id === firstSchedule.json().id)?.id;
+  const correctedVersion = versions.rows.find((item) => item.schedule_id === correctedSchedule.json().id)?.id;
+  assert.ok(firstVersion); assert.ok(correctedVersion);
+  const firstAssignment = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employee.json().id, schedule_version_id: firstVersion,
+    valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(firstAssignment.statusCode, 201, firstAssignment.body);
+  await insertManualPunch(companyA, employee.json().id, '2026-09-14T08:00:00-03:00');
+  await insertManualPunch(companyA, employee.json().id, '2026-09-14T12:00:00-03:00');
+  await replaceAttendanceQueue(companyA, employee.json().id, '2026-09-14T00:00:00-03:00', '2026-09-15T00:00:00-03:00');
+  await drainAttendanceQueue(companyA, employee.json().id, 'the initial work day should be calculated');
+
+  const closed = await request('PATCH', `/v1/schedule-assignments/${firstAssignment.json().id}/close`, tokenA, {
+    company_id: companyA, valid_to: '2026-09-14T00:00:00-03:00',
+  });
+  assert.equal(closed.statusCode, 200, closed.body);
+  const replacement = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: employee.json().id, schedule_version_id: correctedVersion,
+    valid_from: '2026-09-14T00:00:00-03:00',
+  });
+  assert.equal(replacement.statusCode, 201, replacement.body);
+  await replaceAttendanceQueue(companyA, employee.json().id, '2026-09-14T00:00:00-03:00', '2026-09-15T00:00:00-03:00');
+  await drainAttendanceQueue(companyA, employee.json().id, 'the corrected schedule must replace the pending calculation');
+
+  const calculated = await sql.query(
+    `select d.schedule_version_id,c.revision,c.planned_minutes,c.state
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-14' and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, employee.json().id],
+  );
+  assert.deepEqual(calculated.rows[0], {
+    schedule_version_id: correctedVersion, revision: 2, planned_minutes: 300, state: 'final',
+  });
+});
+
 test('worker inclui a saída de um turno que atravessa a meia-noite além da janela da fila', async () => {
   const employee = await request('POST', '/v1/employees', tokenA, {
     company_id: companyA, registration: `N-${stamp}`, name: 'Pessoa do turno noturno', home_location_id: locationA,

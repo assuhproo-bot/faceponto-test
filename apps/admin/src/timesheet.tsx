@@ -163,33 +163,37 @@ function TimeCell(props: PunchEditorProps) {
 export function Timesheet({ employee, punches, days, locations, companyId, token, selectedLocationId, from, to, onSaved }: { employee: Employee | undefined; punches: Punch[]; days: WorkDay[]; locations: Location[]; companyId: string; token: string; selectedLocationId: string; from: string; to: string; onSaved: () => void }) {
   const [rows, setRows] = useState<FinancialAttendanceRow[]>([]); const [totals, setTotals] = useState<FinancialAttendanceTotals | null>(null);
   const [categories, setCategories] = useState<AbsenceCategory[]>([]); const [justifications, setJustifications] = useState<DayJustification[]>([]);
-  const [message, setMessage] = useState(''); const [loading, setLoading] = useState(false); const [saving, setSaving] = useState(false); const [refresh, setRefresh] = useState(0); const [loadedQuery, setLoadedQuery] = useState('');
-  const refreshFinancials = () => setRefresh((value) => value + 1);
+  const [message, setMessage] = useState(''); const [loading, setLoading] = useState(false); const [saving, setSaving] = useState(false); const [refresh, setRefresh] = useState(0); const [loadedQuery, setLoadedQuery] = useState(''); const [pendingRefreshAttempts, setPendingRefreshAttempts] = useState(0);
+  const selectionKey = employee ? [companyId, employee.id, from, to].join('|') : '';
+  const refreshFinancials = () => { setPendingRefreshAttempts(0); setRefresh((value) => value + 1); };
   const refreshPunchesAndFinancials = () => { refreshFinancials(); onSaved(); };
-  const queryKey = employee ? [companyId, employee.id, from, to, refresh].join('|') : '';
   useEffect(() => {
     if (!employee) { setRows([]); setTotals(null); setCategories([]); setJustifications([]); setLoadedQuery(''); return; }
-    const requestedQuery = [companyId, employee.id, from, to, refresh].join('|');
-    let active = true; setLoading(true); setMessage(''); setRows([]); setTotals(null); setCategories([]); setJustifications([]); setLoadedQuery('');
+    const requestedSelection = [companyId, employee.id, from, to].join('|');
+    let active = true; setLoading(true); setMessage('');
     const query = { company_id: companyId, employee_id: employee.id, date_from: from || undefined, date_to: to || undefined };
     void Promise.all([
       api<{ data: FinancialAttendanceRow[]; totals: FinancialAttendanceTotals }>(withQuery('/v1/financial-attendance', query), token),
       api<{ data: AbsenceCategory[] }>(withQuery('/v1/absence-categories', { company_id: companyId }), token),
       api<{ data: DayJustification[] }>(withQuery('/v1/day-justifications', query), token),
     ]).then(([financial, categoriesResult, justificationsResult]) => {
-      if (!active) return; setRows(financial.data); setTotals(financial.totals); setCategories(categoriesResult.data); setJustifications(justificationsResult.data); setLoadedQuery(requestedQuery);
+      if (!active) return; setRows(financial.data); setTotals(financial.totals); setCategories(categoriesResult.data); setJustifications(justificationsResult.data); setLoadedQuery(requestedSelection);
     }).catch((cause) => { if (active) setMessage(cause instanceof ApiError ? cause.message : 'Não foi possível carregar a apuração.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [companyId, employee?.id, from, to, token, refresh]);
 
-  const dataReady = Boolean(queryKey) && loadedQuery === queryKey;
+  const dataReady = Boolean(selectionKey) && loadedQuery === selectionKey;
   const financialPending = dataReady && rows.some((row) => row.financialPending);
   useEffect(() => {
-    if (!financialPending) return;
-    const timer = window.setTimeout(() => setRefresh((value) => value + 1), 2_500);
+    if (!financialPending) { setPendingRefreshAttempts(0); return; }
+    if (pendingRefreshAttempts >= 4) return;
+    const timer = window.setTimeout(() => {
+      setPendingRefreshAttempts((value) => value + 1);
+      setRefresh((value) => value + 1);
+    }, 2_500);
     return () => window.clearTimeout(timer);
-  }, [financialPending]);
+  }, [financialPending, pendingRefreshAttempts]);
   const dailyRows = useMemo(() => {
     if (!dataReady || !employee) return [];
     const financialByDate = new Map(rows.map((row) => [row.date, row]));
@@ -231,6 +235,7 @@ export function Timesheet({ employee, punches, days, locations, companyId, token
   }));
   return <section className="panel timesheet"><div className="timesheet-heading"><div><p className="eyebrow">ESPELHO, HORAS E VALORES</p><h2>{employee.name}</h2><p>Matrícula: {employee.registration} · {from || 'Todo o período'} até {to || 'hoje'}</p></div><small>Os horários são classificados pela escala. Uma batida sem slot fica em “Outras” para revisão, sem ser encaixada por ordem.</small></div>
     {loading && <p className="notice">Atualizando apuração…</p>}
+    {financialPending && pendingRefreshAttempts >= 4 && <p className="notice">O cálculo ainda está sendo processado. <button type="button" className="secondary small-button" onClick={refreshFinancials}>Verificar novamente</button></p>}
     {financialPending && <p className="notice" aria-live="polite">Há alterações em recálculo. Os valores desta data aparecem quando a nova jornada estiver pronta.</p>}
     <div className="timesheet-summary"><article><span>Horas trabalhadas</span><strong>{minutes(totals?.workedMinutes)}</strong></article><article className="neutral"><span>Horas abonadas</span><strong>{minutes(totals?.justifiedMinutes)}</strong></article><article className="positive"><span>Horas extras</span><strong>{minutes(totals?.overtimeMinutes)}</strong></article><article className="negative"><span>Horas faltantes</span><strong>{minutes(totals?.missingMinutes)}</strong></article><article className={((totals?.totalCents ?? 0) < 0) ? 'negative' : 'positive'}><span>Saldo financeiro</span><strong>{currency(totals?.totalCents ?? 0)}</strong></article></div>
     <DailyAdditions companyId={companyId} employeeId={employee.id} token={token} dates={combinedDateRows.map((row) => row.date)} from={from} to={to} onSaved={refreshFinancials} />
