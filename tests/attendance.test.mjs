@@ -120,4 +120,5 @@ test('justificativa abonada converte toda a falta da escala em horas abonadas', 
   assert.equal(result.justified_minutes, 480);
   assert.equal(result.missing_minutes, 0);
   assert.equal(result.net_balance_minutes, 0);
+  assert.equal(result.occurrences.some((item) => item.code === 'ABSENCE'), false);
 });

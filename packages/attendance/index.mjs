@@ -190,7 +190,9 @@ export function evaluateAttendance(input) {
   });
   const invalidMatching = unexpectedPunchCount || matchingOccurrences.length > 0;
 
-  if (punches.length === 0 && definitive) {
+  if (punches.length === 0 && definitive && !input.justification?.abones_hours) {
+    // A paid justification is recorded separately. It covers the scheduled
+    // hours and must not continue to be reported as an open absence.
     occurrences.push({ code: 'ABSENCE', severity: 'error', definitive: true });
   } else if (partialSegment) {
     occurrences.push({ code: 'INCOMPLETE_PUNCHES', severity: definitive ? 'error' : 'warning', definitive });
