@@ -53,7 +53,6 @@ function nearestScheduledSlot(slots, punchMinute) {
 function matchPunchesToSlots(slots, punches) {
   const matches = new Map();
   const occupiedSlots = new Map();
-  const blockedSlots = new Set();
   const occurrences = [];
 
   for (const [punchIndex, punch] of punches.entries()) {
@@ -68,13 +67,15 @@ function matchPunchesToSlots(slots, punches) {
     }
 
     const slot = nearest.candidates[0];
-    if (blockedSlots.has(slot.slot_index)) continue;
-
     const existingPunchIndex = occupiedSlots.get(slot.slot_index);
     if (existingPunchIndex !== undefined) {
-      matches.delete(existingPunchIndex);
-      occupiedSlots.delete(slot.slot_index);
-      blockedSlots.add(slot.slot_index);
+      const existingDistance = Math.abs(punches[existingPunchIndex].relative_minute - slot.planned_minute);
+      const candidateDistance = Math.abs(punch.relative_minute - slot.planned_minute);
+      if (candidateDistance < existingDistance) {
+        matches.delete(existingPunchIndex);
+        matches.set(punchIndex, slot);
+        occupiedSlots.set(slot.slot_index, punchIndex);
+      }
       occurrences.push({
         code: 'SCHEDULE_SLOT_COLLISION', severity: 'warning', definitive: true,
         slot_index: slot.slot_index,
@@ -85,10 +86,6 @@ function matchPunchesToSlots(slots, punches) {
 
     const previous = [...matches.entries()].at(-1);
     if (previous && previous[1].slot_index >= slot.slot_index) {
-      matches.delete(previous[0]);
-      occupiedSlots.delete(previous[1].slot_index);
-      blockedSlots.add(previous[1].slot_index);
-      blockedSlots.add(slot.slot_index);
       occurrences.push({
         code: 'OUT_OF_ORDER_SCHEDULE_SLOT', severity: 'warning', definitive: true,
         event_ids: [punches[previous[0]].id, punch.id],
@@ -161,18 +158,16 @@ export function evaluateAttendance(input) {
     }
   }
 
-  let matches = new Map();
-  let matchingOccurrences = [];
-  let unexpectedPunchCount = false;
-  if (punches.length > slots.length) {
-    unexpectedPunchCount = true;
-    occurrences.unshift({ code: 'UNEXPECTED_PUNCH_COUNT', severity: 'error', definitive });
-  } else {
-    const matching = matchPunchesToSlots(slots, punches);
-    matches = matching.matches;
-    matchingOccurrences = matching.occurrences;
-    occurrences.push(...matchingOccurrences);
-  }
+  // Extra punches must remain visible to the administrator, but they must not
+  // prevent the valid punches of the same day from being calculated.  The old
+  // all-or-nothing branch made a historical day stay "in processing" forever
+  // as soon as it contained one extra or duplicated punch.
+  const matching = matchPunchesToSlots(slots, punches);
+  const matches = matching.matches;
+  const matchingOccurrences = matching.occurrences;
+  const unexpectedPunchCount = punches.length > slots.length;
+  if (unexpectedPunchCount) occurrences.unshift({ code: 'UNEXPECTED_PUNCH_COUNT', severity: 'error', definitive });
+  occurrences.push(...matchingOccurrences);
 
   const matchesBySlot = new Map([...matches.entries()].map(([punchIndex, slot]) => [slot.slot_index, punches[punchIndex]]));
   const missingSlotIndexes = slots.filter((slot) => !matchesBySlot.has(slot.slot_index)).map((slot) => slot.slot_index);
@@ -188,19 +183,21 @@ export function evaluateAttendance(input) {
     const hasEnd = matchesBySlot.has(segmentIndex * 2 + 1);
     return hasStart !== hasEnd;
   });
-  const invalidMatching = unexpectedPunchCount || matchingOccurrences.length > 0;
-
   if (punches.length === 0 && definitive && !input.justification?.abones_hours) {
     // A paid justification is recorded separately. It covers the scheduled
     // hours and must not continue to be reported as an open absence.
     occurrences.push({ code: 'ABSENCE', severity: 'error', definitive: true });
   } else if (partialSegment) {
     occurrences.push({ code: 'INCOMPLETE_PUNCHES', severity: definitive ? 'error' : 'warning', definitive });
-  } else if (missingSlotIndexes.length > 0 && !invalidMatching) {
+  } else if (missingSlotIndexes.length > 0) {
     occurrences.push({ code: 'MISSING_SCHEDULE_SLOTS', severity: definitive ? 'error' : 'warning', definitive });
   }
 
-  if (!definitive || partialSegment || invalidMatching) {
+  // While the journey is still open, wait for the remaining punches.  Once it
+  // is closed, calculate what is known: an incomplete interval contributes no
+  // worked time and its planned duration becomes a documented shortage.  This
+  // gives the panel a final result instead of leaving past days provisional.
+  if (!definitive) {
     return emptyMetrics(input, plannedMinutes, definitive, classifications, occurrences, missingSlotIndexes);
   }
 
@@ -215,7 +212,7 @@ export function evaluateAttendance(input) {
   for (const [segmentIndex, segment] of segments.entries()) {
     const startPunch = matchesBySlot.get(segmentIndex * 2);
     const endPunch = matchesBySlot.get(segmentIndex * 2 + 1);
-    if (!startPunch && !endPunch) {
+    if (!startPunch || !endPunch) {
       previousEndMinute = null;
       continue;
     }

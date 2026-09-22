@@ -36,10 +36,23 @@ test('quatro batidas preservam atraso, extra e saldo como métricas distintas', 
   assert.equal(result.overtime_after_tolerance_minutes, 40);
 });
 
-test('batida faltante mantém saldo final nulo e ocorrência explícita', () => {
+test('batida faltante em jornada encerrada vira falta calculada e ocorrência explícita', () => {
   const result = evaluateAttendance({ ...base, segments: [{ start_minute: 480, end_minute: 1080 }], punches: [punch('a', '2026-09-01T08:10:00-03:00')] });
-  assert.equal(result.net_balance_minutes, null); assert.equal(result.provisional, false);
+  assert.equal(result.worked_minutes, 0); assert.equal(result.missing_minutes, 600);
+  assert.equal(result.net_balance_minutes, -600); assert.equal(result.provisional, false);
   assert.deepEqual(result.occurrences, [{ code: 'INCOMPLETE_PUNCHES', severity: 'error', definitive: true }]);
+});
+
+test('batida extra não deixa um dia já encerrado em processamento', () => {
+  const result = evaluateAttendance({ ...base, segments: [{ start_minute: 480, end_minute: 720 }], punches: [
+    punch('entrada', '2026-09-01T08:00:00-03:00'), punch('saida', '2026-09-01T12:00:00-03:00'),
+    punch('extra', '2026-09-01T12:20:00-03:00'),
+  ] });
+  assert.equal(result.provisional, false);
+  assert.equal(result.worked_minutes, 240);
+  assert.equal(result.missing_minutes, 0);
+  assert.equal(result.net_balance_minutes, 0);
+  assert.equal(result.occurrences.some((item) => item.code === 'UNEXPECTED_PUNCH_COUNT'), true);
 });
 
 test('banco agrega +35 e -20 sem alterar resultados diários', () => {
@@ -62,7 +75,7 @@ test('batidas extras e próximas ficam sem classificação silenciosa', () => {
   ] });
   assert.ok(result.occurrences.some((item) => item.code === 'UNEXPECTED_PUNCH_COUNT'));
   assert.ok(result.occurrences.some((item) => item.code === 'POSSIBLE_DUPLICATE'));
-  assert.deepEqual(result.classifications.map((item) => item.type), ['unclassified', 'unclassified', 'unclassified']);
+  assert.deepEqual(result.classifications.map((item) => item.type), ['entry', 'unclassified', 'exit']);
 });
 
 test('14h e 18h ocupam o segundo período e registram falta da manhã', () => {
@@ -101,7 +114,8 @@ test('horário no ponto médio de dois slots gera ocorrência ambígua', () => {
   ], punches: [punch('a', '2026-09-01T13:00:00-03:00')] });
   assert.deepEqual(result.classifications.map((item) => item.type), ['unclassified']);
   assert.ok(result.occurrences.some((item) => item.code === 'AMBIGUOUS_SCHEDULE_SLOT'));
-  assert.equal(result.net_balance_minutes, null);
+  assert.equal(result.net_balance_minutes, -480);
+  assert.equal(result.missing_minutes, 480);
 });
 
 test('jornada incompleta antes da carência não fecha saldo definitivo', () => {
