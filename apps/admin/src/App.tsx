@@ -269,13 +269,15 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
   const data = dashboard?.companyId === companyId ? dashboard.data : null;
   const selectedCompany = useMemo(() => me?.memberships.find((item) => item.company_id === companyId)?.companies, [companyId, me]);
   const openOccurrences = data?.occurrences?.filter((item) => item.status === 'open').length ?? 0;
+  function selectCompany(nextCompanyId: string) {
+    setCompanyId(nextCompanyId); setDashboard(null); setLoading(true); setError(''); setEmployeeId(''); setLocationId(''); setRegistrationDraft(null); setTimesheetDataKey('');
+  }
   if (companyId && !data && loading) return <main className="centered">Carregando painel…</main>;
   if (loading && !data) return <main className="centered">Carregando painel…</main>;
   return <main className="shell"><header className="app-header"><div className="brand"><img src={lugaLogo} alt="Luga Transportes" /><div><p className="eyebrow">PONTÍFICELUGA</p><h1>{selectedCompany?.name ?? 'Painel administrativo'}</h1></div></div>
-    <div className="header-actions"><button className="secondary" onClick={() => setRefresh((value) => value + 1)}>Atualizar</button><button className="secondary" onClick={onLogout}>Sair</button></div></header>
+    <div className="header-actions"><label className="company-select"><span>Empresa</span><select value={companyId} onChange={(event) => selectCompany(event.target.value)}>{me?.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label><button className="secondary" onClick={() => setRefresh((value) => value + 1)}>Atualizar</button><button className="secondary" onClick={onLogout}>Sair</button></div></header>
     {error && <p className="notice error">{error}</p>}
     {!me?.memberships.length ? <p className="notice">Esta conta ainda não possui uma empresa. Crie uma conta nova para iniciar uma empresa local.</p> : <>
-      <section className="company-switcher" aria-label="Empresa"><label>Empresa<select value={companyId} onChange={(event) => { setCompanyId(event.target.value); setDashboard(null); setLoading(true); setError(''); setEmployeeId(''); setLocationId(''); setRegistrationDraft(null); setTimesheetDataKey(''); }}>{me.memberships.map((item) => <option key={item.company_id} value={item.company_id}>{item.companies?.name ?? item.company_id}</option>)}</select></label></section>
       <nav className="app-tabs" aria-label="Áreas do painel">
         <button className={activeTab === 'overview' ? 'active' : 'secondary'} onClick={() => setActiveTab('overview')}>Visão geral</button>
         <button className={activeTab === 'timesheet' ? 'active' : 'secondary'} onClick={() => setActiveTab('timesheet')}>Apuração</button>
@@ -308,7 +310,9 @@ function SetupGuide({ companyId, locations, employees, terminals, schedules }: {
     { ready: linkedTerminal, title: 'Conecte o terminal', text: 'Com o app aberto no aparelho, gere o código e faça o pareamento.' },
     { ready: schedules.length > 0, title: 'Crie a escala', text: 'Defina os períodos de trabalho para classificar entrada, intervalo e saída.' },
   ];
-  return <section className="setup-guide"><div><p className="eyebrow">COMECE POR AQUI</p><h2>Cadastro e conexão em cinco passos</h2><p>O funcionário não precisa de login. O responsável faz o cadastro pelo painel; o aparelho pareado reconhece e registra o ponto.</p><button className="secondary registration-link" onClick={() => void navigator.clipboard.writeText(registrationLink).then(() => setCopied(true)).catch(() => setCopied(false))}>{copied ? 'Link copiado' : 'Copiar link de solicitação'}</button><small className="registration-help">Envie esse link ao funcionário para ele solicitar o cadastro. A aprovação continua com o responsável.</small></div><ol>{steps.map((step, index) => <li key={step.title} className={step.ready ? 'done' : ''}><span>{step.ready ? '✓' : index + 1}</span><div><strong>{step.title}</strong><small>{step.ready ? 'Concluído' : step.text}</small></div></li>)}</ol></section>;
+  const complete = steps.every((step) => step.ready);
+  const checklist = <ol>{steps.map((step, index) => <li key={step.title} className={step.ready ? 'done' : ''}><span>{step.ready ? '✓' : index + 1}</span><div><strong>{step.title}</strong><small>{step.ready ? 'Concluído' : step.text}</small></div></li>)}</ol>;
+  return <section className={`setup-guide ${complete ? 'is-complete' : ''}`}><div><p className="eyebrow">{complete ? 'SISTEMA PRONTO' : 'COMECE POR AQUI'}</p><h2>{complete ? 'Cadastro e terminais configurados' : 'Cadastro e conexão em cinco passos'}</h2><p>{complete ? 'Os locais, o terminal e a escala estão ativos. Use o link abaixo quando precisar receber um novo pedido de cadastro.' : 'O funcionário não precisa de login. O responsável faz o cadastro pelo painel; o aparelho pareado reconhece e registra o ponto.'}</p><button className="secondary registration-link" onClick={() => void navigator.clipboard.writeText(registrationLink).then(() => setCopied(true)).catch(() => setCopied(false))}>{copied ? 'Link copiado' : 'Copiar link de solicitação'}</button></div>{complete ? <details className="setup-checklist"><summary>Ver etapas concluídas</summary>{checklist}</details> : checklist}</section>;
 }
 function ReportDownloads({ companyId, employeeId, from, to, token }: { companyId: string; employeeId: string; from: string; to: string; token: string }) {
   const [message, setMessage] = useState(''); const [pending, setPending] = useState<'xlsx' | 'pdf' | null>(null);
