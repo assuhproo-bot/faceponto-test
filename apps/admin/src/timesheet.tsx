@@ -140,7 +140,7 @@ function JustificationControl({ companyId, employeeId, date, categories, value, 
 
 type PunchEditorProps = { date: string; label: string; punch: Punch | undefined; missing?: boolean; disabled: boolean; onEdit: (punch: Punch, time: string, reason: string) => Promise<void>; onAdd: (time: string, reason: string) => Promise<void> };
 
-function PunchEditor({ date, label, punch, disabled, onEdit, onAdd }: PunchEditorProps) {
+function PunchEditor({ date, label, punch, missing, disabled, onEdit, onAdd }: PunchEditorProps) {
   const [editing, setEditing] = useState(false); const [time, setTime] = useState(''); const [reason, setReason] = useState(''); const [message, setMessage] = useState(''); const [pending, setPending] = useState(false);
   function start() { setTime(punch ? fortalezaTime(punch.timestamp) : ''); setReason(punch ? 'Correção pela apuração do período' : 'Batida esquecida informada na apuração do período'); setMessage(''); setEditing(true); }
   async function save(event: FormEvent) {
