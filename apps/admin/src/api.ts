@@ -7,7 +7,7 @@ export type CompanyMembership = {
 export type Me = { user: { id: string; email: string | null }; memberships: CompanyMembership[] };
 export type Punch = {
   id: string; employee_id: string; timestamp: string; punch_type: string; sync_status: string; clock_status: string;
-  source: string; reason?: string; original_time_punch_id?: string; original_timestamp?: string;
+  source: string; reason?: string; original_time_punch_id?: string; original_manual_punch_id?: string; original_timestamp?: string;
   location_name: string | null; employee_name: string | null; employee_registration: string | null;
 };
 export type FacialProfileStatus = { employee_id: string; profile_version: number; prepared_at: string };

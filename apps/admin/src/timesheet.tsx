@@ -167,10 +167,13 @@ export function Timesheet({ employee, punches, days, locations, companyId, token
   const selectionKey = employee ? [companyId, employee.id, from, to].join('|') : '';
   const refreshFinancials = () => { setPendingRefreshAttempts(0); setRefresh((value) => value + 1); };
   const refreshPunchesAndFinancials = () => { refreshFinancials(); onSaved(); };
+  // A calculation refresh belongs to the current selection.  Keep a successful
+  // save confirmation visible until the person changes employee or period.
+  useEffect(() => { setMessage(''); }, [selectionKey]);
   useEffect(() => {
     if (!employee) { setRows([]); setTotals(null); setCategories([]); setJustifications([]); setLoadedQuery(''); return; }
     const requestedSelection = [companyId, employee.id, from, to].join('|');
-    let active = true; setLoading(true); setMessage('');
+    let active = true; setLoading(true);
     const query = { company_id: companyId, employee_id: employee.id, date_from: from || undefined, date_to: to || undefined };
     void Promise.all([
       api<{ data: FinancialAttendanceRow[]; totals: FinancialAttendanceTotals }>(withQuery('/v1/financial-attendance', query), token),
@@ -208,7 +211,11 @@ export function Timesheet({ employee, punches, days, locations, companyId, token
       const dayPunches = [...(punchesByDate.get(date) ?? [])].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
       const mapped: Partial<Record<Slot, Punch>> = {}; const extras: Punch[] = [];
       for (const punch of dayPunches) {
-        const type = classifications.get(punch.id);
+        // Corrections have their own audit id while a previous calculation can
+        // still reference the original punch.  Either identifier belongs to the
+        // same visible slot until the recalculation publishes its new revision.
+        const originalPunchId = punch.original_time_punch_id ?? punch.original_manual_punch_id;
+        const type = classifications.get(punch.id) ?? (originalPunchId ? classifications.get(originalPunchId) : undefined);
         if (type && slots.some(([slot]) => slot === type) && !mapped[type as Slot]) mapped[type as Slot] = punch;
         else extras.push(punch);
       }
@@ -219,13 +226,16 @@ export function Timesheet({ employee, punches, days, locations, companyId, token
   const activeLocationId = selectedLocationId || employee?.home_location_id || locations.find((item) => item.active)?.id;
   async function editPunch(punch: Punch, date: string, time: string, reason: string) {
     if (punch.sync_status !== 'accepted') throw new ApiError(409, 'Aguarde a confirmação da batida antes de corrigi-la.');
-    setSaving(true);
-    try { await api(`/v1/punches/${punch.original_time_punch_id ?? punch.id}/adjustments`, token, { method: 'POST', body: JSON.stringify({ company_id: companyId, corrected_timestamp: `${date}T${time}:00-03:00`, reason }) }); setMessage('Horário corrigido. A apuração será atualizada.'); refreshPunchesAndFinancials(); }
+    setSaving(true); setMessage('');
+    const path = punch.source === 'manual'
+      ? `/v1/manual-punches/${punch.original_manual_punch_id ?? punch.id}/adjustments`
+      : `/v1/punches/${punch.original_time_punch_id ?? punch.id}/adjustments`;
+    try { await api(path, token, { method: 'POST', body: JSON.stringify({ company_id: companyId, corrected_timestamp: `${date}T${time}:00-03:00`, reason }) }); setMessage('Horário corrigido. A apuração será atualizada.'); refreshPunchesAndFinancials(); }
     finally { setSaving(false); }
   }
   async function addPunch(date: string, time: string, reason: string) {
     if (!activeLocationId) throw new ApiError(422, 'Escolha um local antes de incluir uma batida.');
-    setSaving(true);
+    setSaving(true); setMessage('');
     try { await api('/v1/manual-punches', token, { method: 'POST', body: JSON.stringify({ company_id: companyId, employee_id: employee?.id, location_id: activeLocationId, corrected_timestamp: `${date}T${time}:00-03:00`, reason }) }); setMessage('Batida incluída. A apuração será atualizada.'); refreshPunchesAndFinancials(); }
     finally { setSaving(false); }
   }

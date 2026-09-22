@@ -242,22 +242,29 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [activeTab, companyId, mergeDashboardData, refresh, session.access_token]);
-  const timesheetQueryKey = [companyId, employeeId, from, to, refresh, timesheetRefresh].join('|');
   const canLoadTimesheet = Boolean(employeeId && from && to);
+  // The selection identifies the data the person asked to see. Refresh counters
+  // only request newer data for that same selection; they must not unmount the
+  // timesheet (and discard a just-saved confirmation) while the request runs.
+  const timesheetSelectionKey = canLoadTimesheet ? [companyId, employeeId, from, to].join('|') : '';
+  const timesheetRequestKey = [timesheetSelectionKey, refresh, timesheetRefresh].join('|');
   useEffect(() => {
     if (activeTab !== 'timesheet' || !companyId || !canLoadTimesheet) { setTimesheetDataKey(''); return; }
-    let active = true; setLoading(true); setError(''); setTimesheetDataKey('');
+    let active = true; setLoading(true); setError('');
+    // Hide stale rows only when the employee or period changed.  A refresh after
+    // saving keeps the current component mounted and updates it in place.
+    setTimesheetDataKey((current) => current === timesheetSelectionKey ? current : '');
     const query = { company_id: companyId, employee_id: employeeId, date_from: from || undefined, date_to: to || undefined };
     void Promise.all([
       api<{ data: WorkDay[] }>(withQuery('/v1/attendance', query), session.access_token),
       api<{ data: Punch[] }>(withQuery('/v1/punches', { company_id: companyId, employee_id: employeeId, punch_from: from ? localDayStart(from) : undefined, punch_to: to ? localDayAfter(to) : undefined }), session.access_token),
     ]).then(([attendance, punches]) => {
       if (!active) return;
-      mergeDashboardData(companyId, { days: attendance.data, punches: punches.data }); setTimesheetDataKey(timesheetQueryKey);
+      mergeDashboardData(companyId, { days: attendance.data, punches: punches.data }); setTimesheetDataKey(timesheetSelectionKey);
     }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : 'Não foi possível carregar a apuração.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [activeTab, canLoadTimesheet, companyId, employeeId, from, mergeDashboardData, refresh, session.access_token, timesheetQueryKey, to]);
+  }, [activeTab, canLoadTimesheet, companyId, employeeId, from, mergeDashboardData, session.access_token, timesheetRequestKey, timesheetSelectionKey, to]);
   useEffect(() => { setRegistrationDraft(null); setTimesheetDataKey(''); }, [companyId]);
   const data = dashboard?.companyId === companyId ? dashboard.data : null;
   const selectedCompany = useMemo(() => me?.memberships.find((item) => item.company_id === companyId)?.companies, [companyId, me]);
@@ -279,7 +286,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
         <button className={activeTab === 'settings' ? 'active' : 'secondary'} onClick={() => setActiveTab('settings')}>Configurações</button>
       </nav>
       {activeTab === 'overview' && <><SetupGuide companyId={companyId} locations={data?.locations ?? []} employees={data?.employees ?? []} terminals={data?.terminals ?? []} schedules={data?.schedules ?? []} /><section className="metrics"><Metric label={`Jornadas (${dashboardRecentDays} dias)`} value={String(data?.days?.length ?? 0)} /><Metric label="Ocorrências abertas" value={String(openOccurrences)} /><Metric label={`Saldo nos últimos ${dashboardRecentDays} dias`} value={minutes(data?.balance)} /></section><RecentPunches values={data?.punches ?? []} days={data?.days ?? []} /><section className="grid"><Journeys days={data?.days ?? []} /><Occurrences values={data?.occurrences ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Bank values={data?.bank ?? []} /></section></>}
-      {activeTab === 'timesheet' && <><TimesheetFilters employees={data?.employees ?? []} locations={data?.locations ?? []} employeeId={employeeId} locationId={locationId} from={from} to={to} onApply={(next) => { const queryChanged = next.employeeId !== employeeId || next.from !== from || next.to !== to; const allFiltersUnchanged = !queryChanged && next.locationId === locationId; setEmployeeId(next.employeeId); setLocationId(next.locationId); setFrom(next.from); setTo(next.to); if (allFiltersUnchanged) setTimesheetRefresh((value) => value + 1); }} />{canLoadTimesheet ? timesheetDataKey === timesheetQueryKey ? <Timesheet employee={data?.employees?.find((item) => item.id === employeeId)} punches={data?.punches ?? []} days={data?.days ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} selectedLocationId={locationId} from={from} to={to} onSaved={() => setTimesheetRefresh((value) => value + 1)} /> : <p className="notice">Carregando apuração…</p> : <p className="notice">Escolha um funcionário e informe as datas de início e fim para abrir a apuração.</p>}</>}
+      {activeTab === 'timesheet' && <><TimesheetFilters employees={data?.employees ?? []} locations={data?.locations ?? []} employeeId={employeeId} locationId={locationId} from={from} to={to} onApply={(next) => { const queryChanged = next.employeeId !== employeeId || next.from !== from || next.to !== to; const allFiltersUnchanged = !queryChanged && next.locationId === locationId; setEmployeeId(next.employeeId); setLocationId(next.locationId); setFrom(next.from); setTo(next.to); if (allFiltersUnchanged) setTimesheetRefresh((value) => value + 1); }} />{canLoadTimesheet ? timesheetDataKey === timesheetSelectionKey ? <Timesheet employee={data?.employees?.find((item) => item.id === employeeId)} punches={data?.punches ?? []} days={data?.days ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} selectedLocationId={locationId} from={from} to={to} onSaved={() => setTimesheetRefresh((value) => value + 1)} /> : <p className="notice">Carregando apuração…</p> : <p className="notice">Escolha um funcionário e informe as datas de início e fim para abrir a apuração.</p>}</>}
       {activeTab === 'payments' && <PaymentManagement companyId={companyId} employees={data?.employees ?? []} departments={data?.departments ?? []} token={session.access_token} />}
       {activeTab === 'people' && <><RegistrationRequests values={data?.registrationRequests ?? []} companyId={companyId} token={session.access_token} onUseForRegistration={setRegistrationDraft} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeManagement values={data?.employees ?? []} departments={data?.departments ?? []} facialProfiles={data?.facialProfiles ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} draft={registrationDraft} onDraftSaved={() => setRegistrationDraft(null)} onSaved={() => setRefresh((value) => value + 1)} /><FacialProfileProvisioning employees={data?.employees ?? []} facialProfiles={data?.facialProfiles ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><EmployeeLocations values={data?.employeeLocations ?? []} employees={data?.employees ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></>}
       {activeTab === 'terminals' && <><section className="grid employees-grid"><Locations values={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /><Terminals values={data?.terminals ?? []} locations={data?.locations ?? []} companyId={companyId} token={session.access_token} onSaved={() => setRefresh((value) => value + 1)} /></section></>}

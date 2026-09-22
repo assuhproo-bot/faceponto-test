@@ -121,7 +121,7 @@ after(async () => {
     for (const table of [
       'public.audit_logs', 'private.attendance_recalculation_queue', 'public.bank_hours',
       'public.attendance_occurrences', 'public.attendance_calculations', 'public.work_days',
-      'public.punch_adjustments',
+      'public.punch_adjustments', 'public.manual_punch_adjustments',
       'public.manual_punches',
       'public.time_punches', 'private.clock_anchors', 'private.facial_profiles',
       'private.terminal_pairings', 'public.terminal_status', 'public.employee_schedule_plans', 'public.schedule_assignments',
@@ -786,6 +786,178 @@ test('administrative punch corrections keep the original and trigger an auditabl
     "select action from public.audit_logs where company_id=$1 and entity_type='punch_adjustments' and entity_id=$2", [companyA, created.json().id],
   );
   assert.equal(audit.rows[0].action, 'INSERT');
+});
+
+test('manual punch corrections preserve the inclusion, project the newest time and recalculate when moved across the window', async () => {
+  const schedule = await request('POST', '/v1/schedules', tokenA, {
+    company_id: companyA, name: `Turno de ajuste manual ${stamp}`, timezone: 'America/Fortaleza', weekdays: [5],
+    rules: { late_tolerance_minutes: 0, overtime_tolerance_minutes: 0, missing_punch_grace_minutes: 0 },
+    segments: [{ ordinal: 1, start_minute: 480, end_minute: 720 }],
+  });
+  assert.equal(schedule.statusCode, 201, schedule.body);
+  const version = await sql.query('select id from public.schedule_versions where company_id=$1 and schedule_id=$2', [companyA, schedule.json().id]);
+  assert.equal(version.rowCount, 1);
+
+  const movedOutEmployee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `MO-${stamp}`, name: 'Pessoa com ajuste manual para fora', home_location_id: locationA,
+  });
+  assert.equal(movedOutEmployee.statusCode, 201, movedOutEmployee.body);
+  const movedOutAssignment = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: movedOutEmployee.json().id, schedule_version_id: version.rows[0].id,
+    valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(movedOutAssignment.statusCode, 201, movedOutAssignment.body);
+  const originalEntryCreated = await request('POST', '/v1/manual-punches', tokenA, {
+    company_id: companyA, employee_id: movedOutEmployee.json().id, location_id: locationA,
+    corrected_timestamp: '2026-09-11T08:00:00-03:00', reason: 'Entrada esquecida registrada pelo RH',
+  });
+  assert.equal(originalEntryCreated.statusCode, 201, originalEntryCreated.body);
+  const originalEntry = originalEntryCreated.json().id as string;
+  const exitCreated = await request('POST', '/v1/manual-punches', tokenA, {
+    company_id: companyA, employee_id: movedOutEmployee.json().id, location_id: locationA,
+    corrected_timestamp: '2026-09-11T12:00:00-03:00', reason: 'Saída esquecida registrada pelo RH',
+  });
+  assert.equal(exitCreated.statusCode, 201, exitCreated.body);
+  const movedOut = await request('POST', `/v1/manual-punches/${originalEntry}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: '2026-09-11T20:00:00-03:00', reason: 'Entrada manual conferida fora da jornada',
+  });
+  assert.equal(movedOut.statusCode, 201, movedOut.body);
+  assert.equal(movedOut.json().original_manual_punch_id, originalEntry);
+  const foreign = await request('POST', `/v1/manual-punches/${originalEntry}/adjustments`, tokenB, {
+    company_id: companyA, corrected_timestamp: '2026-09-11T20:00:00-03:00', reason: 'Tentativa cruzada',
+  });
+  assert.equal(foreign.statusCode, 403, foreign.body);
+  const original = await sql.query('select timestamp from public.manual_punches where id=$1', [originalEntry]);
+  assert.equal(original.rows[0].timestamp.toISOString(), '2026-09-11T11:00:00.000Z');
+  const adjustment = await sql.query(
+    'select original_value,new_value,actor_id from public.manual_punch_adjustments where id=$1', [movedOut.json().id],
+  );
+  assert.equal(adjustment.rowCount, 1);
+  assert.equal(new Date(adjustment.rows[0].original_value.timestamp).toISOString(), '2026-09-11T11:00:00.000Z');
+  assert.equal(new Date(adjustment.rows[0].new_value.timestamp).toISOString(), '2026-09-11T23:00:00.000Z');
+  assert.ok(adjustment.rows[0].actor_id);
+  const effectivePunches = await request('GET', `/v1/punches?company_id=${companyA}&employee_id=${movedOutEmployee.json().id}&punch_from=2026-09-11T00:00:00-03:00&punch_to=2026-09-12T00:00:00-03:00`, tokenA);
+  assert.equal(effectivePunches.statusCode, 200, effectivePunches.body);
+  const effectivePunch = effectivePunches.json().data.find((item: { id: string }) => item.id === movedOut.json().id);
+  assert.ok(effectivePunch);
+  assert.equal(effectivePunch.source, 'manual');
+  assert.equal(effectivePunch.original_manual_punch_id, originalEntry);
+  assert.equal(new Date(effectivePunch.timestamp).toISOString(), '2026-09-11T23:00:00.000Z');
+  assert.equal(effectivePunches.json().data.some((item: { id: string }) => item.id === originalEntry), false);
+  const audit = await sql.query(
+    "select action from public.audit_logs where company_id=$1 and entity_type='manual_punch_adjustments' and entity_id=$2", [companyA, movedOut.json().id],
+  );
+  assert.equal(audit.rows[0].action, 'INSERT');
+  const listedAdjustments = await request('GET', `/v1/punch-adjustments?company_id=${companyA}&employee_id=${movedOutEmployee.json().id}`, tokenA);
+  assert.equal(listedAdjustments.statusCode, 200, listedAdjustments.body);
+  const listedManualAdjustment = listedAdjustments.json().data.find((item: { id: string }) => item.id === movedOut.json().id);
+  assert.ok(listedManualAdjustment);
+  assert.equal(listedManualAdjustment.source, 'manual');
+  await replaceAttendanceQueue(
+    companyA, movedOutEmployee.json().id,
+    '2026-09-11T07:00:00-03:00',
+    '2026-09-11T13:00:00-03:00',
+  );
+  await drainAttendanceQueue(companyA, movedOutEmployee.json().id, 'a manual correction moved out must remove its original time from the journey');
+  const movedOutCalculation = await sql.query(
+    `select c.state,c.worked_minutes
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-11'
+      order by c.revision desc limit 1`,
+    [companyA, movedOutEmployee.json().id],
+  );
+  assert.deepEqual(movedOutCalculation.rows[0], { state: 'provisional', worked_minutes: null });
+
+  const movedInEmployee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `MI-${stamp}`, name: 'Pessoa com ajuste manual para dentro', home_location_id: locationA,
+  });
+  assert.equal(movedInEmployee.statusCode, 201, movedInEmployee.body);
+  const movedInAssignment = await request('POST', '/v1/schedule-assignments', tokenA, {
+    company_id: companyA, employee_id: movedInEmployee.json().id, schedule_version_id: version.rows[0].id,
+    valid_from: '2026-09-01T00:00:00-03:00',
+  });
+  assert.equal(movedInAssignment.statusCode, 201, movedInAssignment.body);
+  const originalOutside = await insertManualPunch(companyA, movedInEmployee.json().id, '2026-09-11T20:00:00-03:00');
+  await insertManualPunch(companyA, movedInEmployee.json().id, '2026-09-11T12:00:00-03:00');
+  const movedIn = await request('POST', `/v1/manual-punches/${originalOutside}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: '2026-09-11T08:00:00-03:00', reason: 'Entrada manual conferida dentro da jornada',
+  });
+  assert.equal(movedIn.statusCode, 201, movedIn.body);
+  await replaceAttendanceQueue(
+    companyA, movedInEmployee.json().id,
+    '2026-09-11T00:00:00-03:00',
+    '2026-09-11T02:00:00-03:00',
+  );
+  await drainAttendanceQueue(companyA, movedInEmployee.json().id, 'a manual correction moved into the candidate window must be counted');
+  const movedInCalculation = await sql.query(
+    `select c.state,c.worked_minutes,c.missing_minutes,c.net_balance_minutes
+       from public.work_days d join public.attendance_calculations c on c.work_day_id=d.id
+      where d.company_id=$1 and d.employee_id=$2 and d.local_date='2026-09-11' and c.state='final'
+      order by c.revision desc limit 1`,
+    [companyA, movedInEmployee.json().id],
+  );
+  assert.deepEqual(movedInCalculation.rows[0], {
+    state: 'final', worked_minutes: 240, missing_minutes: 0, net_balance_minutes: 0,
+  });
+});
+
+test('chained corrections queue the raw, prior effective and newest days for terminal and manual punches', async () => {
+  const rawTime = '2026-09-04T08:00:00-03:00';
+  // Keep the prior effective correction after the newest timestamp. The old
+  // implementation only queued the raw and newest times, so it would leave
+  // 25/09 outside the affected range and skip recalculating that day.
+  const firstCorrectionTime = '2026-09-25T08:00:00-03:00';
+  const newestCorrectionTime = '2026-09-18T08:00:00-03:00';
+  const assertQueueCoversAllAffectedTimes = (row: { affected_from: string; affected_to: string }) => {
+    assert.ok(new Date(row.affected_from).getTime() <= new Date(rawTime).getTime());
+    assert.ok(new Date(row.affected_to).getTime() >= new Date(newestCorrectionTime).getTime());
+    // The intermediate, prior effective time must be covered even though it
+    // falls after the newest correction time.
+    assert.ok(new Date(row.affected_from).getTime() <= new Date(firstCorrectionTime).getTime());
+    assert.ok(new Date(row.affected_to).getTime() >= new Date(firstCorrectionTime).getTime());
+  };
+
+  const terminalEmployee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `CQ-T-${stamp}`, name: 'Pessoa com correções faciais encadeadas', home_location_id: locationA,
+  });
+  assert.equal(terminalEmployee.statusCode, 201, terminalEmployee.body);
+  const terminalPunch = await insertAcceptedPunch(companyA, terminalEmployee.json().id, rawTime);
+  const firstTerminalCorrection = await request('POST', `/v1/punches/${terminalPunch}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: firstCorrectionTime, reason: 'Primeira correção para outro dia',
+  });
+  assert.equal(firstTerminalCorrection.statusCode, 201, firstTerminalCorrection.body);
+  await sql.query('delete from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2', [companyA, terminalEmployee.json().id]);
+  const newestTerminalCorrection = await request('POST', `/v1/punches/${terminalPunch}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: newestCorrectionTime, reason: 'Segunda correção para um terceiro dia',
+  });
+  assert.equal(newestTerminalCorrection.statusCode, 201, newestTerminalCorrection.body);
+  const terminalQueue = await sql.query(
+    'select affected_from,affected_to from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2',
+    [companyA, terminalEmployee.json().id],
+  );
+  assert.equal(terminalQueue.rowCount, 1);
+  assertQueueCoversAllAffectedTimes(terminalQueue.rows[0]);
+
+  const manualEmployee = await request('POST', '/v1/employees', tokenA, {
+    company_id: companyA, registration: `CQ-M-${stamp}`, name: 'Pessoa com correções manuais encadeadas', home_location_id: locationA,
+  });
+  assert.equal(manualEmployee.statusCode, 201, manualEmployee.body);
+  const manualPunch = await insertManualPunch(companyA, manualEmployee.json().id, rawTime);
+  const firstManualCorrection = await request('POST', `/v1/manual-punches/${manualPunch}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: firstCorrectionTime, reason: 'Primeira correção manual para outro dia',
+  });
+  assert.equal(firstManualCorrection.statusCode, 201, firstManualCorrection.body);
+  await sql.query('delete from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2', [companyA, manualEmployee.json().id]);
+  const newestManualCorrection = await request('POST', `/v1/manual-punches/${manualPunch}/adjustments`, tokenA, {
+    company_id: companyA, corrected_timestamp: newestCorrectionTime, reason: 'Segunda correção manual para um terceiro dia',
+  });
+  assert.equal(newestManualCorrection.statusCode, 201, newestManualCorrection.body);
+  const manualQueue = await sql.query(
+    'select affected_from,affected_to from private.attendance_recalculation_queue where company_id=$1 and employee_id=$2',
+    [companyA, manualEmployee.json().id],
+  );
+  assert.equal(manualQueue.rowCount, 1);
+  assertQueueCoversAllAffectedTimes(manualQueue.rows[0]);
 });
 
 test('terminal reassignment is atomic and preserves queue status and assignment history', async () => {

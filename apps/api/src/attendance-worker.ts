@@ -19,6 +19,7 @@ type Candidate = {
   punches: Array<{ id: string; timestamp: string }>; ambiguous: string[];
 };
 type Adjustment = { id: string; original_time_punch_id: string; corrected_timestamp: string; created_at: string };
+type ManualAdjustment = { id: string; original_manual_punch_id: string; corrected_timestamp: string; created_at: string };
 type Justification = { local_date: string; abones_hours: boolean; absence_categories: { name: string } | null };
 
 const WORKER_PAGE_SIZE = 1_000;
@@ -171,6 +172,23 @@ export function startAttendanceWorker(config: ApiConfig) {
       const manualPunches = await readAll<{ id: string; timestamp: string }>((from, to) => admin.from('manual_punches').select('id,timestamp')
         .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id)
         .gte('timestamp', punchWindow.from).lte('timestamp', punchWindow.to).order('timestamp').order('id').range(from, to));
+      const manualAdjustmentsMovedIntoWindow = await readAll<ManualAdjustment>((from, to) => admin.from('manual_punch_adjustments')
+        .select('id,original_manual_punch_id,corrected_timestamp,created_at')
+        .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id)
+        .gte('corrected_timestamp', punchWindow.from).lte('corrected_timestamp', punchWindow.to)
+        .order('created_at', { ascending: false }).order('id', { ascending: false }).range(from, to));
+      const manualAdjustmentOriginalIds = [...new Set([
+        ...manualPunches.map((punch) => punch.id),
+        ...manualAdjustmentsMovedIntoWindow.map((adjustment) => adjustment.original_manual_punch_id),
+      ])];
+      const manualAdjustmentsForOriginals: ManualAdjustment[] = [];
+      for (let index = 0; index < manualAdjustmentOriginalIds.length; index += 200) {
+        const originalIds = manualAdjustmentOriginalIds.slice(index, index + 200);
+        manualAdjustmentsForOriginals.push(...await readAll<ManualAdjustment>((from, to) => admin.from('manual_punch_adjustments')
+          .select('id,original_manual_punch_id,corrected_timestamp,created_at')
+          .eq('company_id', activeJob.company_id).eq('employee_id', activeJob.employee_id).in('original_manual_punch_id', originalIds)
+          .order('created_at', { ascending: false }).order('id', { ascending: false }).range(from, to)));
+      }
       const adjustments = [...new Map([...adjustmentsMovedIntoWindow, ...adjustmentsForOriginals]
         .map((adjustment) => [adjustment.id, adjustment])).values()]
         .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id));
@@ -178,10 +196,18 @@ export function startAttendanceWorker(config: ApiConfig) {
       for (const adjustment of adjustments) {
         if (!currentAdjustments.has(adjustment.original_time_punch_id)) currentAdjustments.set(adjustment.original_time_punch_id, adjustment);
       }
+      const manualAdjustments = [...new Map([...manualAdjustmentsMovedIntoWindow, ...manualAdjustmentsForOriginals]
+        .map((adjustment) => [adjustment.id, adjustment])).values()]
+        .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id));
+      const currentManualAdjustments = new Map<string, ManualAdjustment>();
+      for (const adjustment of manualAdjustments) {
+        if (!currentManualAdjustments.has(adjustment.original_manual_punch_id)) currentManualAdjustments.set(adjustment.original_manual_punch_id, adjustment);
+      }
       const effectivePunches = [
         ...punches.filter((punch) => !currentAdjustments.has(punch.id)),
         ...[...currentAdjustments.values()].map((adjustment) => ({ id: adjustment.id, timestamp: adjustment.corrected_timestamp })),
-        ...manualPunches.map((punch) => ({ id: punch.id, timestamp: punch.timestamp })),
+        ...manualPunches.filter((punch) => !currentManualAdjustments.has(punch.id)),
+        ...[...currentManualAdjustments.values()].map((adjustment) => ({ id: adjustment.id, timestamp: adjustment.corrected_timestamp })),
       ].sort((left, right) => left.timestamp.localeCompare(right.timestamp) || left.id.localeCompare(right.id));
       for (const punch of effectivePunches) {
         const instant = Date.parse(punch.timestamp); const eligible = candidates

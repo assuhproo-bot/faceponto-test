@@ -889,7 +889,10 @@ export function buildApp(config: ApiConfig) {
     type Relation = { name?: string; registration?: string };
     type RawPunch = Record<string, unknown> & { id: string; employee_id: string; location_id: string; timestamp: string; source: string; sync_status: string; clock_status: string; punch_type: string; employees?: Relation | Relation[]; locations?: Relation | Relation[] };
     type Adjustment = { id: string; original_time_punch_id: string; corrected_timestamp: string; reason: string; created_at: string };
+    type ManualAdjustment = { id: string; original_manual_punch_id: string; corrected_timestamp: string; reason: string; created_at: string };
+    type RawManualPunch = Record<string, unknown> & { id: string; employee_id: string; location_id: string; timestamp: string; reason: string; employees?: Relation | Relation[]; locations?: Relation | Relation[] };
     const punchFields = 'id,employee_id,company_id,location_id,terminal_id,timestamp,device_timestamp,server_timestamp,punch_type,source,sync_status,clock_status,result_code,created_at,employees(name,registration),locations(name)';
+    const manualPunchFields = 'id,employee_id,company_id,location_id,timestamp,reason,created_at,employees(name,registration),locations(name)';
     let builder = request.auth!.db.from('time_punches').select('id,employee_id,company_id,location_id,terminal_id,timestamp,device_timestamp,server_timestamp,punch_type,source,sync_status,clock_status,result_code,created_at,employees(name,registration),locations(name)')
       .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
@@ -949,7 +952,7 @@ export function buildApp(config: ApiConfig) {
       const location = Array.isArray(punch.locations) ? punch.locations[0] : punch.locations;
       return [{ ...punch, id: adjustment?.id ?? punch.id, timestamp, original_time_punch_id: adjustment?.original_time_punch_id, original_timestamp: adjustment ? punch.timestamp : undefined, reason: adjustment?.reason, location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null }];
     });
-    let manualBuilder = request.auth!.db.from('manual_punches').select('id,employee_id,company_id,location_id,timestamp,reason,created_at,employees(name,registration),locations(name)')
+    let manualBuilder = request.auth!.db.from('manual_punches').select(manualPunchFields)
       .eq('company_id', query.company_id).order('timestamp', { ascending: false }).limit(200);
     if (query.employee_id) manualBuilder = manualBuilder.eq('employee_id', query.employee_id);
     if (query.location_id) manualBuilder = manualBuilder.eq('location_id', query.location_id);
@@ -957,12 +960,57 @@ export function buildApp(config: ApiConfig) {
     if (query.punch_to) manualBuilder = manualBuilder.lt('timestamp', query.punch_to);
     const { data: manualData, error: manualError } = await manualBuilder;
     if (manualError) return mapDatabaseError(reply, request, manualError);
-    const namedManualPunches = (manualData ?? []).map(({ employees, locations, ...punch }: { employees?: { name?: string; registration?: string } | Array<{ name?: string; registration?: string }>; locations?: { name?: string } | Array<{ name?: string }> } & Record<string, unknown>) => {
-      const employee = Array.isArray(employees) ? employees[0] : employees;
-      const location = Array.isArray(locations) ? locations[0] : locations;
-      return { ...punch, source: 'manual', punch_type: 'unclassified', sync_status: 'accepted', clock_status: 'verified', location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null };
+    const rawManualPunches = (manualData ?? []) as unknown as RawManualPunch[];
+
+    // A manual inclusion is immutable too. Its newest adjustment becomes the
+    // effective timestamp, including when it moves into the selected period.
+    let movedManualBuilder = request.auth!.db.from('manual_punch_adjustments')
+      .select('id,original_manual_punch_id,corrected_timestamp,reason,created_at')
+      .eq('company_id', query.company_id).order('created_at', { ascending: false }).order('id', { ascending: false }).limit(1_000);
+    if (query.employee_id) movedManualBuilder = movedManualBuilder.eq('employee_id', query.employee_id);
+    if (query.punch_from) movedManualBuilder = movedManualBuilder.gte('corrected_timestamp', query.punch_from);
+    if (query.punch_to) movedManualBuilder = movedManualBuilder.lt('corrected_timestamp', query.punch_to);
+    const { data: movedManualData, error: movedManualError } = await movedManualBuilder;
+    if (movedManualError) return mapDatabaseError(reply, request, movedManualError);
+    const movedManualAdjustments = (movedManualData ?? []) as unknown as ManualAdjustment[];
+
+    const rawManualById = new Map(rawManualPunches.map((item) => [item.id, item]));
+    const movedManualOriginalIds = [...new Set(movedManualAdjustments.map((item) => item.original_manual_punch_id).filter((id) => !rawManualById.has(id)))];
+    for (let offset = 0; offset < movedManualOriginalIds.length; offset += 200) {
+      let originalManualBuilder = request.auth!.db.from('manual_punches').select(manualPunchFields)
+        .eq('company_id', query.company_id).in('id', movedManualOriginalIds.slice(offset, offset + 200));
+      if (query.employee_id) originalManualBuilder = originalManualBuilder.eq('employee_id', query.employee_id);
+      if (query.location_id) originalManualBuilder = originalManualBuilder.eq('location_id', query.location_id);
+      const { data: originals, error: originalManualError } = await originalManualBuilder;
+      if (originalManualError) return mapDatabaseError(reply, request, originalManualError);
+      for (const original of (originals ?? []) as unknown as RawManualPunch[]) rawManualById.set(original.id, original);
+    }
+
+    const manualAdjustments: ManualAdjustment[] = [];
+    const manualOriginalIds = [...rawManualById.keys()];
+    for (let offset = 0; offset < manualOriginalIds.length; offset += 200) {
+      let manualAdjustmentBuilder = request.auth!.db.from('manual_punch_adjustments')
+        .select('id,original_manual_punch_id,corrected_timestamp,reason,created_at')
+        .eq('company_id', query.company_id).in('original_manual_punch_id', manualOriginalIds.slice(offset, offset + 200))
+        .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(1_000);
+      if (query.employee_id) manualAdjustmentBuilder = manualAdjustmentBuilder.eq('employee_id', query.employee_id);
+      const { data: adjustmentData, error: manualAdjustmentError } = await manualAdjustmentBuilder;
+      if (manualAdjustmentError) return mapDatabaseError(reply, request, manualAdjustmentError);
+      manualAdjustments.push(...(adjustmentData ?? []) as unknown as ManualAdjustment[]);
+    }
+    const latestManualAdjustmentByOriginal = new Map<string, ManualAdjustment>();
+    for (const adjustment of [...manualAdjustments, ...movedManualAdjustments].sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id))) {
+      if (!latestManualAdjustmentByOriginal.has(adjustment.original_manual_punch_id)) latestManualAdjustmentByOriginal.set(adjustment.original_manual_punch_id, adjustment);
+    }
+    const projectedManualPunches = [...rawManualById.values()].flatMap((punch) => {
+      const adjustment = latestManualAdjustmentByOriginal.get(punch.id);
+      const timestamp = adjustment?.corrected_timestamp ?? punch.timestamp;
+      if (!inRequestedPeriod(timestamp)) return [];
+      const employee = Array.isArray(punch.employees) ? punch.employees[0] : punch.employees;
+      const location = Array.isArray(punch.locations) ? punch.locations[0] : punch.locations;
+      return [{ ...punch, id: adjustment?.id ?? punch.id, timestamp, original_manual_punch_id: adjustment?.original_manual_punch_id, original_timestamp: adjustment ? punch.timestamp : undefined, reason: adjustment?.reason ?? punch.reason, source: 'manual', punch_type: 'unclassified', sync_status: 'accepted', clock_status: 'verified', location_name: location?.name ?? null, employee_name: employee?.name ?? null, employee_registration: employee?.registration ?? null }];
     });
-    const allPunches = [...projectedPunches, ...namedManualPunches] as unknown as Array<Record<string, unknown> & { timestamp: string }>;
+    const allPunches = [...projectedPunches, ...projectedManualPunches] as unknown as Array<Record<string, unknown> & { timestamp: string }>;
     return { data: allPunches.sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, 200) };
   });
   app.post('/v1/punches/:id/adjustments', async (request, reply) => {
@@ -982,15 +1030,31 @@ export function buildApp(config: ApiConfig) {
     if (dbError) return mapDatabaseError(reply, request, dbError);
     return reply.code(201).send(data);
   });
+  app.post('/v1/manual-punches/:id/adjustments', async (request, reply) => {
+    const params = punchParams.parse(request.params); const body = punchAdjustmentBody.parse(request.body);
+    const { data, error: dbError } = await request.auth!.db.rpc('create_manual_punch_adjustment', {
+      p_company: body.company_id, p_manual_punch: params.id, p_corrected_timestamp: body.corrected_timestamp, p_reason: body.reason,
+    });
+    if (dbError) return mapDatabaseError(reply, request, dbError);
+    return reply.code(201).send(data);
+  });
   app.get('/v1/punch-adjustments', async (request, reply) => {
     const query = punchAdjustmentsQuery.parse(request.query);
     let builder = request.auth!.db.from('punch_adjustments')
       .select('id,company_id,employee_id,original_time_punch_id,original_value,new_value,corrected_timestamp,reason,actor_id,created_at')
       .eq('company_id', query.company_id).order('created_at', { ascending: false }).limit(200);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
-    const { data, error: dbError } = await builder;
+    let manualBuilder = request.auth!.db.from('manual_punch_adjustments')
+      .select('id,company_id,employee_id,original_manual_punch_id,original_value,new_value,corrected_timestamp,reason,actor_id,created_at')
+      .eq('company_id', query.company_id).order('created_at', { ascending: false }).limit(200);
+    if (query.employee_id) manualBuilder = manualBuilder.eq('employee_id', query.employee_id);
+    const [{ data, error: dbError }, { data: manualData, error: manualError }] = await Promise.all([builder, manualBuilder]);
     if (dbError) return mapDatabaseError(reply, request, dbError);
-    return { data };
+    if (manualError) return mapDatabaseError(reply, request, manualError);
+    const manualAdjustments = (manualData ?? []).map(({ original_manual_punch_id, ...adjustment }) => ({
+      ...adjustment, original_time_punch_id: original_manual_punch_id, source: 'manual',
+    }));
+    return { data: [...(data ?? []), ...manualAdjustments].sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id)).slice(0, 200) };
   });
   app.get('/v1/absence-categories', async (request, reply) => {
     const query = absenceCategoriesQuery.parse(request.query);
