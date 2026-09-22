@@ -1134,7 +1134,7 @@ export function buildApp(config: ApiConfig) {
   app.get('/v1/attendance', async (request, reply) => {
     const query = attendanceQuery.parse(request.query);
     let builder = request.auth!.db.from('work_days')
-      .select('id,company_id,employee_id,schedule_version_id,journey_start,journey_end,local_date,timezone,attendance_calculations(id,revision,engine_version,rules_version,state,planned_minutes,worked_minutes,regular_minutes,justified_minutes,missing_minutes,late_minutes,late_after_tolerance_minutes,early_departure_minutes,break_minutes,gross_overtime_minutes,overtime_after_tolerance_minutes,net_balance_minutes,classifications,calculated_at)')
+      .select('id,company_id,employee_id,schedule_version_id,journey_start,journey_end,local_date,timezone,schedule_versions(schedule_segments(ordinal)),attendance_calculations(id,revision,engine_version,rules_version,state,planned_minutes,worked_minutes,regular_minutes,justified_minutes,missing_minutes,late_minutes,late_after_tolerance_minutes,early_departure_minutes,break_minutes,gross_overtime_minutes,overtime_after_tolerance_minutes,net_balance_minutes,classifications,calculated_at)')
       .eq('company_id', query.company_id).order('local_date', { ascending: false }).limit(500);
     if (query.employee_id) builder = builder.eq('employee_id', query.employee_id);
     if (query.date_from) builder = builder.gte('local_date', query.date_from);

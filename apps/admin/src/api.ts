@@ -76,6 +76,7 @@ export type FinancialAttendanceTotals = {
 };
 export type WorkDay = {
   id: string; employee_id: string; local_date: string; timezone: string;
+  schedule_versions?: { schedule_segments: Array<{ ordinal: number }> } | null;
   attendance_calculations: Array<{
     id: string; revision: number; state: string; planned_minutes: number; worked_minutes: number | null;
     late_minutes: number | null; gross_overtime_minutes: number | null; net_balance_minutes: number | null;
