@@ -436,7 +436,7 @@ function toAttendanceReport(financialAttendance: FinancialAttendance): Attendanc
 }
 
 export function buildApp(config: ApiConfig) {
-  const app = Fastify({ logger: false, bodyLimit: 512 * 1024, requestIdHeader: 'x-request-id' });
+  const app = Fastify({ logger: { level: 'error' }, bodyLimit: 512 * 1024, requestIdHeader: 'x-request-id' });
   void app.register(cors, {
     origin: config.ADMIN_ORIGIN ?? false,
     credentials: true,
