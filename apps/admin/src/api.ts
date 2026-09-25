@@ -123,7 +123,7 @@ export type EmployeeRegistrationRequest = {
   status: 'pending' | 'reviewed' | 'declined'; created_at: string; reviewed_at: string | null;
 };
 
-const baseUrl = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
+const baseUrl = (import.meta.env?.VITE_API_URL ?? '').replace(/\/$/, '');
 
 /** Uses the deployed API in production and Vite's local proxy during development. */
 export function apiUrl(path: string) { return `${baseUrl}${path}`; }
@@ -133,9 +133,12 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, accessToken: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  headers.set('authorization', `Bearer ${accessToken}`);
+  if (init?.body != null && !headers.has('content-type')) headers.set('content-type', 'application/json');
   const response = await fetch(apiUrl(path), {
     ...init,
-    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json', ...(init?.headers ?? {}) },
+    headers,
   });
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
